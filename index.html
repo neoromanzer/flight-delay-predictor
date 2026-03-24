@@ -77,7 +77,8 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
 const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip: RChartTip,
-        ResponsiveContainer, PieChart, Pie, Cell, RadialBarChart, RadialBar } = Recharts;
+        ResponsiveContainer, PieChart, Pie, Cell, RadialBarChart, RadialBar,
+        LineChart, Line } = Recharts;
 
 function callClaude(body){
   return fetch("https://api.anthropic.com/v1/messages",{
@@ -236,6 +237,51 @@ function localHHMM(offsetMin, tz){
 function parseCS(cs){if(!cs)return{flight:"------",airline:"---"};const pfx=cs.slice(0,3).toUpperCase(),al=AIRLINES[pfx];return al?{flight:al.iata+cs.slice(3),airline:al.name}:{flight:cs,airline:pfx};}
 function depTimes(f,tz){const lhm=m=>localHHMM(m,tz);const eobt=f.eobt_offset||0,taxi=f.taxi_minutes||18,tobt=eobt+(f.tobt_delta||0),tsat=tobt-taxi,ttot=tobt+taxi,ctot=f.ctot_regulated?ttot+(f.ctot_delta||0):null;return{EOBT:lhm(eobt),TOBT:lhm(tobt),TSAT:lhm(tsat),CTOT:ctot!=null?lhm(ctot):"----",TTOT:lhm(ttot)};}
 function arrTimes(f,tz){const lhm=m=>localHHMM(m,tz);const sta=f.sta_offset||0,txi=f.taxi_in_minutes||10,eta=sta+(f.eta_delta||0);return{STA:lhm(sta),ETA:lhm(eta),ELDT:lhm(eta-2),EGTT:lhm(eta-2+txi)};}
+
+// ── HISTORY UTILITIES ─────────────────────────────────────────────────────────
+const HIST_KEY=ap=>`_hist_${ap}`;
+const HIST_MAX_AGE=30*86400000;
+
+function computeSnapshot(deps,arrs){
+  const all=[...deps,...arrs];
+  if(!all.length) return null;
+  const low=all.filter(f=>f.risk_level==="low").length;
+  const med=all.filter(f=>f.risk_level==="medium").length;
+  const high=all.filter(f=>f.risk_level==="high").length;
+  const total=all.length;
+  const avgDelay=Math.round(all.reduce((s,f)=>s+(f.estimated_delay_minutes||0),0)/total);
+  const onTimeRate=Math.round((low/total)*100);
+  const airlinesRaw={};
+  all.forEach(f=>{
+    const {airline}=parseCS(f.callsign);
+    if(!airlinesRaw[airline]) airlinesRaw[airline]={total:0,delaySum:0,low:0,med:0,high:0};
+    const a=airlinesRaw[airline];
+    a.total++;a.delaySum+=(f.estimated_delay_minutes||0);
+    if(f.risk_level==="low")a.low++;else if(f.risk_level==="medium")a.med++;else a.high++;
+  });
+  const airlines={};
+  Object.entries(airlinesRaw).forEach(([name,d])=>{
+    airlines[name]={total:d.total,avgDelay:Math.round(d.delaySum/d.total),onTimeRate:Math.round((d.low/d.total)*100),riskCounts:{low:d.low,med:d.med,high:d.high}};
+  });
+  return{timestamp:Date.now(),overall:{avgDelay,onTimeRate,riskCounts:{low,med,high},total},airlines};
+}
+
+function loadHistory(ap){
+  try{
+    const raw=localStorage.getItem(HIST_KEY(ap));
+    if(!raw) return [];
+    const cutoff=Date.now()-HIST_MAX_AGE;
+    return JSON.parse(raw).filter(s=>s.timestamp>cutoff);
+  }catch{return [];}
+}
+
+function saveHistory(ap,deps,arrs){
+  const snap=computeSnapshot(deps,arrs);
+  if(!snap) return;
+  const hist=loadHistory(ap);
+  hist.push(snap);
+  try{localStorage.setItem(HIST_KEY(ap),JSON.stringify(hist.slice(-200)));}catch{}
+}
 
 // ── SHARED PRIMITIVES ─────────────────────────────────────────────────────────
 function SectionLabel({children,accent=C.teal,icon}){
@@ -665,6 +711,128 @@ function NOTAMFeed({notams,loading,selAP,apName}){
   );
 }
 
+// ── HISTORY DASHBOARD ─────────────────────────────────────────────────────────
+function HistoryDashboard({selAP,refreshKey}){
+  const [airlineFilter,setAirlineFilter]=useState("ALL");
+  const history=useMemo(()=>loadHistory(selAP),[selAP,refreshKey]);
+
+  const airlines=useMemo(()=>{
+    const set=new Set(["ALL"]);
+    history.forEach(s=>Object.keys(s.airlines||{}).forEach(a=>set.add(a)));
+    return[...set];
+  },[history]);
+
+  useEffect(()=>setAirlineFilter("ALL"),[selAP]);
+
+  if(!history.length) return(
+    <div style={{padding:48,textAlign:"center",color:C.textLo,fontSize:"12px",letterSpacing:"0.1em"}}>
+      NO HISTORY YET — RUN PREDICTIONS TO BUILD TREND DATA
+    </div>
+  );
+
+  const chartData=history.map(s=>{
+    const ts=new Date(s.timestamp);
+    const label=`${String(ts.getMonth()+1).padStart(2,"0")}/${String(ts.getDate()).padStart(2,"0")} ${String(ts.getHours()).padStart(2,"0")}:${String(ts.getMinutes()).padStart(2,"0")}`;
+    if(airlineFilter==="ALL"){
+      return{label,avgDelay:s.overall.avgDelay,onTimeRate:s.overall.onTimeRate,low:s.overall.riskCounts.low,med:s.overall.riskCounts.med,high:s.overall.riskCounts.high};
+    }
+    const a=(s.airlines||{})[airlineFilter];
+    if(!a) return null;
+    return{label,avgDelay:a.avgDelay,onTimeRate:a.onTimeRate,low:a.riskCounts.low,med:a.riskCounts.med,high:a.riskCounts.high};
+  }).filter(Boolean);
+
+  const TICK={fill:C.textLo,fontSize:9,fontFamily:"'Barlow Condensed',Arial,sans-serif",fontWeight:700};
+  const CTip=({active,payload,label})=>{
+    if(!active||!payload||!payload.length) return null;
+    return(
+      <div style={{background:C.surface,border:"1px solid "+C.teal,padding:"8px 12px",fontSize:"11px",color:C.textHi}}>
+        <div style={{color:C.teal,fontWeight:700,marginBottom:4}}>{label}</div>
+        {payload.map((p,i)=>(
+          <div key={i} style={{color:C.textMid}}>{p.name}: <strong style={{color:p.stroke||p.fill||C.textHi}}>{p.value}{p.unit||""}</strong></div>
+        ))}
+      </div>
+    );
+  };
+
+  if(!chartData.length) return(
+    <div style={{padding:48,textAlign:"center",color:C.textLo,fontSize:"12px",letterSpacing:"0.1em"}}>
+      NO DATA FOR {airlineFilter} AT {selAP}
+    </div>
+  );
+
+  return(
+    <div style={{padding:"20px 24px",backgroundImage:DOT_BG,backgroundSize:"24px 24px"}}>
+      <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        <SectionLabel icon="◈">HISTORICAL TRENDS — {selAP}</SectionLabel>
+        <div style={{marginLeft:"auto",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.12em"}}>AIRLINE</span>
+          {airlines.map(a=>(
+            <button key={a} onClick={()=>setAirlineFilter(a)}
+              style={{background:airlineFilter===a?C.tealDim:"rgba(0,0,0,0.2)",border:"1px solid "+(airlineFilter===a?C.teal:C.border),color:airlineFilter===a?C.teal:C.textLo,padding:"4px 10px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"10px",fontWeight:700,letterSpacing:"0.08em",cursor:"pointer"}}>
+              {a}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>AVG EST. DELAY (MINUTES)</div>
+          <ResponsiveContainer width="100%" height={150}>
+            <LineChart data={chartData}>
+              <CartesianGrid strokeDasharray="2 4" stroke={C.borderS} vertical={false}/>
+              <XAxis dataKey="label" tick={TICK} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+              <YAxis tick={TICK} axisLine={false} tickLine={false} width={28}/>
+              <RChartTip content={<CTip/>}/>
+              <Line type="monotone" dataKey="avgDelay" stroke={C.amber} strokeWidth={2} dot={chartData.length<20} name="Avg Delay" unit="M"/>
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>ON-TIME RATE (%)</div>
+          <ResponsiveContainer width="100%" height={150}>
+            <LineChart data={chartData}>
+              <CartesianGrid strokeDasharray="2 4" stroke={C.borderS} vertical={false}/>
+              <XAxis dataKey="label" tick={TICK} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+              <YAxis tick={TICK} axisLine={false} tickLine={false} width={28} domain={[0,100]}/>
+              <RChartTip content={<CTip/>}/>
+              <Line type="monotone" dataKey="onTimeRate" stroke={C.green} strokeWidth={2} dot={chartData.length<20} name="On-Time Rate" unit="%"/>
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+        <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>RISK DISTRIBUTION OVER TIME</div>
+        <ResponsiveContainer width="100%" height={180}>
+          <BarChart data={chartData} barCategoryGap="10%">
+            <CartesianGrid strokeDasharray="2 4" stroke={C.borderS} vertical={false}/>
+            <XAxis dataKey="label" tick={TICK} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis tick={TICK} axisLine={false} tickLine={false} width={28}/>
+            <RChartTip content={<CTip/>}/>
+            <Bar dataKey="low" stackId="r" fill={C.green} name="Low"/>
+            <Bar dataKey="med" stackId="r" fill={C.amber} name="Medium"/>
+            <Bar dataKey="high" stackId="r" fill={C.red} name="High" radius={[2,2,0,0]}/>
+          </BarChart>
+        </ResponsiveContainer>
+        <div style={{display:"flex",gap:16,marginTop:10,justifyContent:"center"}}>
+          {[["LOW",C.green],["MEDIUM",C.amber],["HIGH",C.red]].map(([l,c])=>(
+            <div key={l} style={{display:"flex",alignItems:"center",gap:5}}>
+              <div style={{width:10,height:10,borderRadius:2,background:c}}/>
+              <span style={{color:C.textMid,fontSize:"10px"}}>{l}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{marginTop:10,color:C.textLo,fontSize:"9px",textAlign:"center",letterSpacing:"0.1em"}}>
+        {chartData.length} SNAPSHOT{chartData.length!==1?"S":""} · LAST 30 DAYS · STORED LOCALLY IN BROWSER
+      </div>
+    </div>
+  );
+}
+
 // ── STATS STRIP ───────────────────────────────────────────────────────────────
 function StatsStrip({deps,arrs}){
   const all=[...deps,...arrs];
@@ -1080,6 +1248,7 @@ function App(){
   const [localClock,setLocalClock]=useState("--:--:--");
   const [rfTip,setRfTip]=useState(null);
   const [selectedFlight,setSelectedFlight]=useState(null);
+  const [histRefresh,setHistRefresh]=useState(0);
 
   useEffect(()=>{
     const tick=()=>{
@@ -1094,6 +1263,13 @@ function App(){
     };
     tick(); const id=setInterval(tick,1000); return()=>clearInterval(id);
   },[selAP]);
+
+  useEffect(()=>{
+    if(phase==="done"&&flights){
+      saveHistory(selAP,flights.deps||[],flights.arrs||[]);
+      setHistRefresh(r=>r+1);
+    }
+  },[phase,flights]);
 
   const setStep=(i,s)=>setSteps(p=>{const n=p.slice();n[i]=s;return n;});
 
@@ -1351,6 +1527,7 @@ Mix categories realistically. Be specific to ${ap.city}.`;
           {key:"arr",label:`ARRIVALS (${arrs.length})`,col:"#6699FF"},
           {key:"metrics",label:"METRICS",col:"#A060FF"},
           {key:"notam",label:`NOTAM${notamHighCount>0?" ⚠"+notamHighCount:""}`,col:C.amber},
+          {key:"history",label:"HISTORY",col:"#4488FF"},
         ].map(({key,label,col})=>(
           <button key={key} onClick={()=>{setTab(key);setSelectedFlight(null);}}
             style={{background:"none",border:"none",borderBottom:tab===key?`3px solid ${col}`:"3px solid transparent",color:tab===key?C.textHi:C.textLo,padding:"11px 22px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"12px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",cursor:"pointer"}}>
@@ -1440,6 +1617,7 @@ Mix categories realistically. Be specific to ${ap.city}.`;
 
       {tab==="metrics"&&<MetricsDashboard deps={deps} arrs={arrs} selAP={selAP}/>}
       {tab==="notam"&&<NOTAMFeed notams={notams} loading={notamLoading} selAP={selAP} apName={ap?ap.name:selAP}/>}
+      {tab==="history"&&<HistoryDashboard selAP={selAP} refreshKey={histRefresh}/>}
 
       {/* FOOTER */}
       <div style={{borderTop:"1px solid "+C.border,padding:"10px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:C.bgDeep}}>
