@@ -1,0 +1,1488 @@
+[index.html](https://github.com/user-attachments/files/26208417/index.html)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Flight Delay Predictor</title>
+
+  <!-- React 18 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel (compiles JSX in-browser) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+  <!-- d3 v7 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+
+  <!-- TopoJSON -->
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+
+  <!-- Recharts (requires React on window first) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.10.4/Recharts.min.js"></script>
+
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#080808;color:#fff;font-family:'Barlow Condensed',Arial,sans-serif}
+    #root{min-height:100vh}
+
+    /* API key modal */
+    #key-modal{position:fixed;inset:0;background:rgba(0,0,0,0.92);display:flex;align-items:center;justify-content:center;z-index:99999;font-family:'Barlow Condensed',Arial,sans-serif}
+    #key-modal.hidden{display:none}
+    #key-box{background:#07131F;border:1px solid #00D4D4;padding:32px 36px;max-width:440px;width:90%}
+    #key-box h2{color:#fff;font-size:18px;font-weight:700;letter-spacing:0.08em;margin-bottom:8px}
+    #key-box p{color:#90B0C8;font-size:12px;line-height:1.6;margin-bottom:20px}
+    #key-box a{color:#00D4D4}
+    #key-input{width:100%;background:#030303;border:1px solid rgba(255,255,255,0.15);border-left:3px solid #00D4D4;color:#fff;padding:10px 14px;font-family:monospace;font-size:13px;outline:none;margin-bottom:12px}
+    #key-btn{background:#00D4D4;border:none;color:#030303;padding:10px 28px;font-family:'Barlow Condensed',Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:0.12em;cursor:pointer;width:100%}
+    #key-btn:hover{background:#00EEEE}
+    #key-err{color:#FF3A3A;font-size:11px;margin-top:6px;display:none}
+
+    /* Reset key button (bottom of page) */
+    #reset-key{position:fixed;bottom:12px;left:12px;background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.1);color:#3A5570;font-size:9px;padding:4px 10px;cursor:pointer;font-family:'Barlow Condensed',Arial,sans-serif;letter-spacing:0.1em;z-index:1000}
+    #reset-key:hover{color:#90B0C8;border-color:rgba(255,255,255,0.2)}
+  </style>
+</head>
+<body>
+
+<!-- API Key Modal -->
+<div id="key-modal">
+  <div id="key-box">
+    <h2>ANTHROPIC API KEY</h2>
+    <p>This app calls the Anthropic API directly from your browser. Your key is stored only in your browser's local storage and never sent anywhere else.<br/><br/>
+    Get a key at <a href="https://console.anthropic.com" target="_blank">console.anthropic.com</a></p>
+    <input id="key-input" type="password" placeholder="sk-ant-..." autocomplete="off"/>
+    <div id="key-err">Invalid key format — should start with sk-ant-</div>
+    <button id="key-btn">SAVE AND LAUNCH</button>
+  </div>
+</div>
+
+<!-- App root -->
+<div id="root"></div>
+
+<!-- Reset key button -->
+<button id="reset-key" onclick="localStorage.removeItem('fdp_api_key');location.reload()">RESET API KEY</button>
+
+<script>
+  // Show modal if no key stored
+  (function(){
+    const modal=document.getElementById('key-modal');
+    const input=document.getElementById('key-input');
+    const btn=document.getElementById('key-btn');
+    const err=document.getElementById('key-err');
+
+    if(localStorage.getItem('fdp_api_key')){
+      modal.classList.add('hidden');
+      return;
+    }
+
+    btn.onclick=function(){
+      const v=input.value.trim();
+      if(!v.startsWith('sk-ant-')){
+        err.style.display='block';
+        return;
+      }
+      localStorage.setItem('fdp_api_key',v);
+      modal.classList.add('hidden');
+    };
+
+    input.addEventListener('keydown',function(e){
+      if(e.key==='Enter') btn.click();
+    });
+  })();
+
+  // Expose key getter for app code
+  function getApiKey(){ return localStorage.getItem('fdp_api_key')||''; }
+</script>
+
+<!-- Google Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@700&display=swap" rel="stylesheet"/>
+
+<script type="text/babel" data-presets="react">
+// ── GLOBALS FROM CDN ──────────────────────────────────────────────────────────
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
+const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip: RChartTip,
+        ResponsiveContainer, PieChart, Pie, Cell, RadialBarChart, RadialBar } = Recharts;
+
+// API call helper — reads key from localStorage
+function callClaude(body){
+  return fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-api-key": getApiKey(),
+      "anthropic-version":"2023-06-01",
+      "anthropic-dangerous-direct-browser-access":"true"
+    },
+    body:JSON.stringify(body)
+  });
+}
+
+// ── DESIGN TOKENS ─────────────────────────────────────────────────────────────
+const C = {
+  bg:       "#080808",
+  bgDeep:   "#030303",
+  surface:  "#050E1A",
+  raised:   "#07131F",
+  hover:    "#0C2236",
+  panel:    "#060E16",
+  border:   "rgba(255,255,255,0.10)",
+  borderS:  "rgba(255,255,255,0.05)",
+  textHi:   "#FFFFFF",
+  textMid:  "#90B0C8",
+  textLo:   "#3A5570",
+  teal:     "#00D4D4",
+  tealDim:  "rgba(0,212,212,0.10)",
+  tealGlow: "rgba(0,212,212,0.20)",
+  green:    "#00E090",
+  amber:    "#F0A020",
+  red:      "#FF3A3A",
+  blue:     "#4488FF",
+};
+const rc = r => r==="high"?C.red:r==="medium"?C.amber:C.green;
+const DOT_BG = `radial-gradient(circle, rgba(255,255,255,0.04) 1px, transparent 1px)`;
+
+// ── STATIC DATA ───────────────────────────────────────────────────────────────
+const AIRPORTS = {
+  AUH:{icao:"OMAA",name:"Abu Dhabi International",city:"Abu Dhabi",lat:24.433,lon:54.651,tz:"Asia/Dubai"},
+  DXB:{icao:"OMDB",name:"Dubai International",city:"Dubai",lat:25.253,lon:55.364,tz:"Asia/Dubai"},
+  DOH:{icao:"OTHH",name:"Hamad International",city:"Doha",lat:25.273,lon:51.608,tz:"Asia/Qatar"},
+  LHR:{icao:"EGLL",name:"Heathrow",city:"London",lat:51.477,lon:-0.461,tz:"Europe/London"},
+  CDG:{icao:"LFPG",name:"Charles de Gaulle",city:"Paris",lat:49.009,lon:2.548,tz:"Europe/Paris"},
+  FRA:{icao:"EDDF",name:"Frankfurt",city:"Frankfurt",lat:50.038,lon:8.562,tz:"Europe/Berlin"},
+  JFK:{icao:"KJFK",name:"JFK International",city:"New York",lat:40.641,lon:-73.778,tz:"America/New_York"},
+  LAX:{icao:"KLAX",name:"Los Angeles Intl",city:"Los Angeles",lat:33.943,lon:-118.408,tz:"America/Los_Angeles"},
+  SIN:{icao:"WSSS",name:"Changi",city:"Singapore",lat:1.359,lon:103.989,tz:"Asia/Singapore"},
+  BOM:{icao:"VABB",name:"Chhatrapati Shivaji",city:"Mumbai",lat:19.089,lon:72.868,tz:"Asia/Kolkata"},
+  DEL:{icao:"VIDP",name:"Indira Gandhi Intl",city:"New Delhi",lat:28.556,lon:77.100,tz:"Asia/Kolkata"},
+  HKG:{icao:"VHHH",name:"Hong Kong Intl",city:"Hong Kong",lat:22.309,lon:113.915,tz:"Asia/Hong_Kong"},
+  NRT:{icao:"RJAA",name:"Narita Intl",city:"Tokyo",lat:35.765,lon:140.386,tz:"Asia/Tokyo"},
+  SYD:{icao:"YSSY",name:"Kingsford Smith",city:"Sydney",lat:-33.946,lon:151.177,tz:"Australia/Sydney"},
+  JNB:{icao:"FAOR",name:"O.R. Tambo Intl",city:"Johannesburg",lat:-26.133,lon:28.242,tz:"Africa/Johannesburg"},
+  CAI:{icao:"HECA",name:"Cairo International",city:"Cairo",lat:30.122,lon:31.406,tz:"Africa/Cairo"},
+  IST:{icao:"LTFM",name:"Istanbul Airport",city:"Istanbul",lat:41.275,lon:28.752,tz:"Europe/Istanbul"},
+  AMS:{icao:"EHAM",name:"Schiphol",city:"Amsterdam",lat:52.309,lon:4.764,tz:"Europe/Amsterdam"},
+  MAD:{icao:"LEMD",name:"Madrid Barajas",city:"Madrid",lat:40.472,lon:-3.561,tz:"Europe/Madrid"},
+  FCO:{icao:"LIRF",name:"Fiumicino",city:"Rome",lat:41.800,lon:12.239,tz:"Europe/Rome"},
+  KWI:{icao:"OKBK",name:"Kuwait International",city:"Kuwait City",lat:29.226,lon:47.969,tz:"Asia/Kuwait"},
+  RUH:{icao:"OERK",name:"King Khalid Intl",city:"Riyadh",lat:24.958,lon:46.699,tz:"Asia/Riyadh"},
+  MCT:{icao:"OOMS",name:"Muscat International",city:"Muscat",lat:23.593,lon:58.284,tz:"Asia/Muscat"},
+  CMB:{icao:"VCBI",name:"Bandaranaike Intl",city:"Colombo",lat:7.181,lon:79.884,tz:"Asia/Colombo"},
+  KHI:{icao:"OPKC",name:"Jinnah International",city:"Karachi",lat:24.906,lon:67.161,tz:"Asia/Karachi"},
+  NBO:{icao:"HKJK",name:"Jomo Kenyatta Intl",city:"Nairobi",lat:-1.319,lon:36.926,tz:"Africa/Nairobi"},
+  BCN:{icao:"LEBL",name:"El Prat",city:"Barcelona",lat:41.297,lon:2.078,tz:"Europe/Madrid"},
+  MUC:{icao:"EDDM",name:"Munich Airport",city:"Munich",lat:48.354,lon:11.786,tz:"Europe/Berlin"},
+  BKK:{icao:"VTBS",name:"Suvarnabhumi",city:"Bangkok",lat:13.681,lon:100.747,tz:"Asia/Bangkok"},
+  PEK:{icao:"ZBAA",name:"Beijing Capital",city:"Beijing",lat:40.080,lon:116.584,tz:"Asia/Shanghai"},
+  ICN:{icao:"RKSI",name:"Incheon International",city:"Seoul",lat:37.469,lon:126.451,tz:"Asia/Seoul"},
+  CPT:{icao:"FACT",name:"Cape Town Intl",city:"Cape Town",lat:-33.965,lon:18.602,tz:"Africa/Johannesburg"},
+  BAH:{icao:"OBBI",name:"Bahrain Intl",city:"Manama",lat:26.270,lon:50.634,tz:"Asia/Bahrain"},
+  JED:{icao:"OEJN",name:"King Abdulaziz Intl",city:"Jeddah",lat:21.680,lon:39.157,tz:"Asia/Riyadh"},
+  ADD:{icao:"HAAB",name:"Addis Ababa Bole",city:"Addis Ababa",lat:8.978,lon:38.799,tz:"Africa/Addis_Ababa"},
+  ZRH:{icao:"LSZH",name:"Zurich Airport",city:"Zurich",lat:47.458,lon:8.548,tz:"Europe/Zurich"},
+  GVA:{icao:"LSGG",name:"Geneva Airport",city:"Geneva",lat:46.238,lon:6.109,tz:"Europe/Zurich"},
+  MXP:{icao:"LIMC",name:"Malpensa",city:"Milan",lat:45.630,lon:8.723,tz:"Europe/Rome"},
+  DPS:{icao:"WADD",name:"Ngurah Rai Intl",city:"Bali",lat:-8.748,lon:115.167,tz:"Asia/Makassar"},
+  VIE:{icao:"LOWW",name:"Vienna International",city:"Vienna",lat:48.110,lon:16.570,tz:"Europe/Vienna"},
+};
+
+const AIRLINES = {
+  ETD:{iata:"EY",name:"Etihad Airways"}, UAE:{iata:"EK",name:"Emirates"},
+  QTR:{iata:"QR",name:"Qatar Airways"}, BAW:{iata:"BA",name:"British Airways"},
+  DLH:{iata:"LH",name:"Lufthansa"}, THY:{iata:"TK",name:"Turkish Airlines"},
+  AFR:{iata:"AF",name:"Air France"}, KLM:{iata:"KL",name:"KLM"},
+  AAL:{iata:"AA",name:"American Airlines"}, UAL:{iata:"UA",name:"United Airlines"},
+  SWR:{iata:"LX",name:"Swiss International"}, FDB:{iata:"FZ",name:"flydubai"},
+  ABY:{iata:"G9",name:"Air Arabia"}, GFA:{iata:"GF",name:"Gulf Air"},
+  OMA:{iata:"WY",name:"Oman Air"}, SVA:{iata:"SV",name:"Saudia"},
+  AIC:{iata:"AI",name:"Air India"}, SIA:{iata:"SQ",name:"Singapore Airlines"},
+  THA:{iata:"TG",name:"Thai Airways"}, CPA:{iata:"CX",name:"Cathay Pacific"},
+  JAL:{iata:"JL",name:"Japan Airlines"}, QFA:{iata:"QF",name:"Qantas"},
+  MSR:{iata:"MS",name:"EgyptAir"}, ETH:{iata:"ET",name:"Ethiopian Airlines"},
+  KQA:{iata:"KQ",name:"Kenya Airways"}, MAS:{iata:"MH",name:"Malaysia Airlines"},
+  DAL:{iata:"DL",name:"Delta Air Lines"}, VIR:{iata:"VS",name:"Virgin Atlantic"},
+};
+
+const WX = {0:"CLEAR",1:"MOSTLY CLR",2:"PARTLY CLD",3:"OVERCAST",45:"FOG",48:"RIME FOG",51:"LT DRIZZLE",61:"LT RAIN",63:"RAIN",65:"HVY RAIN",71:"LT SNOW",73:"SNOW",80:"SHOWERS",95:"THUNDERSTORM"};
+
+const RF = {
+  "CTOT REGULATION":{short:"ATFM slot restriction by Network Manager.",what:"A CTOT has been assigned by EUROCONTROL NM or GCAA, constraining departure to a specific window.",why:"En-route sector capacity exceeded. Ground holding is more efficient than airborne holding.",impact:"Must depart within CTOT +5/−5 min. Missing the slot adds 20–40 min.",ref:"EUROCONTROL NM ATFM Regulations, ICAO Doc 9971 Ch.3"},
+  "WEATHER":{short:"Adverse met conditions affecting operations.",what:"Significant weather at origin, en-route or destination: thunderstorms, heavy rain, low cloud or high crosswinds.",why:"Aircraft may need holding fuel uplifts, alternates or de-icing, adding turnaround time.",impact:"15–60 min for tactical avoidance; up to 3h for embedded convection.",ref:"ICAO Annex 3, Ops Spec approval minima"},
+  "LATE INBOUND":{short:"Inbound aircraft delayed — reactionary chain.",what:"The aircraft on this rotation is delayed on its inbound sector.",why:"Most short/medium-haul delays are reactionary. One missed slot cascades forward.",impact:"Typically 60–80% of inbound delay propagates outbound after turnaround.",ref:"IATA CDM Guidebook v7, Reactionary Delay Taxonomy"},
+  "CREW REST":{short:"FTL rest requirements not met.",what:"Crew cumulative duty hours or rest period cannot be legally met before departure.",why:"Flight Time Limitations mandate minimum rest. Operating in breach is a safety violation.",impact:"Delay until legal rest completes. Min 10h for long-haul. May require crew swap.",ref:"EASA ORO.FTL.235, UAE GCAA ANO-OPS-001"},
+  "SLOT CONSTRAINT":{short:"Slot conflict at co-ordinated airport.",what:"The airport is Level 3 slot-co-ordinated and the requested movement falls outside the allocated window.",why:"Co-ordinated airports operate at declared capacity. All movements need IATA slot approval.",impact:"Departure held until valid slot. Peak periods can add 30–90 min.",ref:"IATA Worldwide Slot Guidelines 9th Ed., EC 793/2004"},
+  "WIND SHEAR":{short:"Wind shear on approach or SID.",what:"Rapid change in wind speed/direction on final approach, missed approach or departure path.",why:"Forces wider runway separation and increases go-around probability.",impact:"Runway throughput falls 20–35%. Queue delays of 10–25 min build quickly.",ref:"ICAO Doc 9817 Wind Shear Manual"},
+  "LOW VISIBILITY":{short:"LVP active — CAT II/III ops in force.",what:"Visibility below 550m RVR or ceiling below 200ft. Low Visibility Procedures activated.",why:"ILS critical areas must be protected, requiring greater separation on final.",impact:"Capacity reduced 30–50%. Typically 25–35 movements/hr vs 45–55 in VMC.",ref:"ICAO Doc 9365, EASA CS-AWO"},
+  "HIGH LOAD":{short:"High pax load — late boarding close.",what:"Load factor exceeds 95%. Check-in, baggage and boarding are under pressure.",why:"High-density flights take longer to board and require more load planning time.",impact:"Boarding close delays 8–15 min, rippling into taxi queue.",ref:"IATA AHM 810 Ground Operations"},
+  "ATC RESTRICTION":{short:"En-route or terminal flow restriction.",what:"ATC issued a miles-in-trail or flow restriction on the departure route.",why:"Sector overload or adjacent airport traffic requires spacing management.",impact:"Ground delay absorbs restriction. Typical hold: 10–30 min.",ref:"ICAO Doc 4444 PANS-ATM Ch.3"},
+  "GATE CONFLICT":{short:"Stand occupied — outbound blocked.",what:"Inbound has not vacated the assigned stand, or ground equipment is blocking access.",why:"Peak hour congestion at hubs frequently causes stand conflicts.",impact:"Remote parking adds 15–20 min, or aircraft held on apron.",ref:"IATA AHM 730 Apron Management"},
+};
+
+const GLOSSARY = [
+  {term:"EOBT",def:"Estimated Off-Block Time — initial airline estimate of push-back from stand."},
+  {term:"TOBT",def:"Target Off-Block Time — agreed push-back time confirmed by airline, handler and CDM system."},
+  {term:"TSAT",def:"Target Start-Up Approval Time — ATC engine-start approval. Derived as TOBT minus taxi-out time."},
+  {term:"CTOT",def:"Calculated Take-Off Time — ATFM slot by Network Manager when flow control is active."},
+  {term:"TTOT",def:"Target Take-Off Time — expected wheels-up. Computed as TOBT plus taxi-out duration."},
+  {term:"STA", def:"Scheduled Time of Arrival — published OAG/SSIM schedule time."},
+  {term:"ETA", def:"Estimated Time of Arrival — updated from flight progress, winds and routing."},
+  {term:"ELDT",def:"Estimated Landing Time — predicted touchdown at threshold (ETA minus 2 min)."},
+  {term:"EGTT",def:"Estimated Gate Time — predicted in-blocks at stand. ELDT plus airport taxi-in time."},
+];
+
+const CDM_SRC = [
+  {m:"TSAT",f:"TOBT - Taxi-Out",src:"ICAO Doc 9971 S3.4 / EUROCONTROL A-CDM Manual v5"},
+  {m:"TTOT",f:"TOBT + Taxi-Out",src:"EUROCONTROL A-CDM Manual v5, Figure 3-2"},
+  {m:"CTOT",f:"TTOT + ATFM Offset",src:"EUROCONTROL NM ATFM Regulations / CFMU slot allocation"},
+  {m:"ELDT",f:"ETA - 2 min",src:"ICAO Doc 4444 PANS-ATM S8.9.3"},
+  {m:"EGTT",f:"ELDT + Taxi-In",src:"Airport ATMAP/AODB ground movement data (default 10 min)"},
+  {m:"ETA", f:"STA + AI delay offset",src:"AI inference from OpenSky ADS-B + Open-Meteo weather"},
+];
+
+const NOTAM_CATS = {
+  RWY:{label:"RUNWAY",col:"#FF3A3A",icon:"▬"},
+  ILS:{label:"ILS/NAV",col:"#F0A020",icon:"◎"},
+  NAV:{label:"NAVAID",col:"#F0A020",icon:"◈"},
+  OBST:{label:"OBSTACLE",col:"#FF7A00",icon:"▲"},
+  COM:{label:"COMMS",col:"#4488FF",icon:"◉"},
+  AD:{label:"AERODROME",col:"#00D4D4",icon:"✦"},
+  AIRSPACE:{label:"AIRSPACE",col:"#A060FF",icon:"◇"},
+};
+
+// ── UTILITY ───────────────────────────────────────────────────────────────────
+function localHHMM(offsetMin, tz){
+  const t=new Date(Date.now()+offsetMin*60000);
+  if(!tz) return String(t.getUTCHours()).padStart(2,"0")+":"+String(t.getUTCMinutes()).padStart(2,"0");
+  try{
+    return new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour:"2-digit",minute:"2-digit",hour12:false}).format(t);
+  }catch{
+    return String(t.getUTCHours()).padStart(2,"0")+":"+String(t.getUTCMinutes()).padStart(2,"0");
+  }
+}
+function parseCS(cs){if(!cs)return{flight:"------",airline:"---"};const pfx=cs.slice(0,3).toUpperCase(),al=AIRLINES[pfx];return al?{flight:al.iata+cs.slice(3),airline:al.name}:{flight:cs,airline:pfx};}
+function depTimes(f,tz){const lhm=m=>localHHMM(m,tz);const eobt=f.eobt_offset||0,taxi=f.taxi_minutes||18,tobt=eobt+(f.tobt_delta||0),tsat=tobt-taxi,ttot=tobt+taxi,ctot=f.ctot_regulated?ttot+(f.ctot_delta||0):null;return{EOBT:lhm(eobt),TOBT:lhm(tobt),TSAT:lhm(tsat),CTOT:ctot!=null?lhm(ctot):"----",TTOT:lhm(ttot)};}
+function arrTimes(f,tz){const lhm=m=>localHHMM(m,tz);const sta=f.sta_offset||0,txi=f.taxi_in_minutes||10,eta=sta+(f.eta_delta||0);return{STA:lhm(sta),ETA:lhm(eta),ELDT:lhm(eta-2),EGTT:lhm(eta-2+txi)};}
+
+// ── SHARED PRIMITIVES ─────────────────────────────────────────────────────────
+function SectionLabel({children,accent=C.teal,icon}){
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+      <div style={{width:3,height:14,background:accent,borderRadius:2,flexShrink:0}}/>
+      {icon&&<span style={{color:accent,fontSize:"12px"}}>{icon}</span>}
+      <span style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.18em"}}>{children}</span>
+    </div>
+  );
+}
+
+function KPICard({label,value,sub,col=C.textHi}){
+  return(
+    <div style={{padding:"14px 16px",background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,flex:1,minWidth:100}}>
+      <div style={{color:C.textLo,fontSize:"8px",fontWeight:700,letterSpacing:"0.16em",marginBottom:6,textTransform:"uppercase"}}>{label}</div>
+      <div style={{color:col,fontSize:"26px",fontWeight:700,lineHeight:1,letterSpacing:"-0.01em"}}>{value}</div>
+      {sub&&<div style={{color:C.textLo,fontSize:"9px",marginTop:4}}>{sub}</div>}
+    </div>
+  );
+}
+
+// ── RF TOOLTIP ────────────────────────────────────────────────────────────────
+function RFTooltip({factor,x,y}){
+  const d=RF[factor]; if(!d) return null;
+  return(
+    <div style={{position:"fixed",left:Math.min(x,window.innerWidth-360),top:Math.max(y-10,8),zIndex:9999,background:`linear-gradient(135deg,${C.surface},${C.panel})`,border:"1px solid "+C.teal,width:340,padding:"14px 16px",pointerEvents:"none",boxShadow:"0 12px 40px rgba(0,0,0,0.7)"}}>
+      <div style={{color:C.teal,fontSize:"10px",fontWeight:700,letterSpacing:"0.14em",marginBottom:8,paddingBottom:8,borderBottom:"1px solid "+C.border}}>{factor}</div>
+      <div style={{color:C.textHi,fontSize:"12px",marginBottom:10,lineHeight:1.6}}>{d.short}</div>
+      {[["WHAT",d.what],["WHY IT CAUSES DELAY",d.why]].map((row,i)=>(
+        <div key={i} style={{marginBottom:8}}>
+          <div style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.1em",fontWeight:700,marginBottom:3}}>{row[0]}</div>
+          <div style={{color:C.textMid,fontSize:"11px",lineHeight:1.6}}>{row[1]}</div>
+        </div>
+      ))}
+      <div style={{marginBottom:8,padding:"8px 10px",background:"rgba(240,160,32,0.08)",border:"1px solid rgba(240,160,32,0.2)"}}>
+        <div style={{color:C.amber,fontSize:"9px",letterSpacing:"0.1em",fontWeight:700,marginBottom:3}}>OPERATIONAL IMPACT</div>
+        <div style={{color:C.textMid,fontSize:"11px",lineHeight:1.6}}>{d.impact}</div>
+      </div>
+      <div style={{color:C.textLo,fontSize:"9px",fontStyle:"italic"}}>{d.ref}</div>
+    </div>
+  );
+}
+
+// ── DETAIL PANEL ──────────────────────────────────────────────────────────────
+function DetailPanel({flight,isDep,selAP,onClose}){
+  const [remoteWx,setRemoteWx]=useState(null);
+  const [wxLoading,setWxLoading]=useState(true);
+  const remoteIcao=isDep?flight.dest_icao:flight.orig_icao;
+  const remoteAP=Object.values(AIRPORTS).find(a=>a.icao===remoteIcao);
+  const cs=parseCS(flight.callsign);
+  const times=flight.times;
+  const delayMins=flight.estimated_delay_minutes||0;
+  const riskCol=rc(flight.risk_level);
+
+  useEffect(()=>{
+    setRemoteWx(null);setWxLoading(true);
+    if(!remoteAP) return;
+    fetch(`https://api.open-meteo.com/v1/forecast?latitude=${remoteAP.lat}&longitude=${remoteAP.lon}&current=temperature_2m,wind_speed_10m,weather_code,visibility`)
+      .then(r=>r.ok?r.json():null).then(d=>{setRemoteWx(d?d.current:null);setWxLoading(false);}).catch(()=>setWxLoading(false));
+  },[flight.callsign]);
+
+  const milestones=isDep
+    ?[{label:"EOBT",time:times.EOBT,col:C.textMid,desc:"Initial estimate"},{label:"TOBT",time:times.TOBT,col:C.textHi,desc:"Agreed target"},{label:"TSAT",time:times.TSAT,col:C.teal,desc:"Start-up approval"},...(flight.ctot_regulated?[{label:"CTOT",time:times.CTOT,col:C.amber,desc:"ATFM regulated"}]:[]),{label:"TTOT",time:times.TTOT,col:C.green,desc:"Wheels-up"}]
+    :[{label:"STA",time:times.STA,col:C.textMid,desc:"Schedule"},{label:"ETA",time:times.ETA,col:C.textHi,desc:"Updated est."},{label:"ELDT",time:times.ELDT,col:C.teal,desc:"Touchdown"},{label:"EGTT",time:times.EGTT,col:C.green,desc:"In-blocks"}];
+
+  const wxDesc=remoteWx&&remoteWx.weather_code!=null?(WX[remoteWx.weather_code]||"CODE "+remoteWx.weather_code):"--";
+
+  return(
+    <div className="detail-panel" style={{position:"fixed",right:0,top:0,bottom:0,width:460,background:C.panel,borderLeft:"2px solid "+C.teal,zIndex:1000,display:"flex",flexDirection:"column",boxShadow:"-8px 0 40px rgba(0,0,0,0.9)",overflowY:"auto",fontFamily:"'Barlow Condensed',Arial,sans-serif"}}>
+      <div style={{background:C.raised,padding:"20px 22px",borderBottom:"2px solid "+C.teal,flexShrink:0}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+          <div>
+            <div style={{color:C.teal,fontSize:"34px",fontWeight:700,letterSpacing:"0.08em",lineHeight:1}}>{cs.flight}</div>
+            <div style={{color:C.textMid,fontSize:"13px",marginTop:4}}>{cs.airline}</div>
+          </div>
+          <button onClick={onClose} style={{background:C.surface,border:"1px solid "+C.border,color:C.textLo,fontSize:"14px",cursor:"pointer",width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}
+            onMouseEnter={e=>{e.currentTarget.style.borderColor=C.teal;e.currentTarget.style.color=C.teal;}}
+            onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border;e.currentTarget.style.color=C.textLo;}}>✕</button>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,fontSize:"12px"}}>
+          <span style={{color:C.textHi,fontWeight:700}}>{selAP}</span>
+          <span style={{color:C.teal,fontSize:"16px"}}>→</span>
+          <span style={{color:C.textHi,fontWeight:700}}>{isDep?(flight.destination_name||flight.dest_icao||"---"):(flight.origin_name||flight.orig_icao||"---")}</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+          <span style={{display:"inline-block",padding:"3px 10px",fontSize:"10px",fontWeight:700,letterSpacing:"0.1em",color:riskCol,background:C.bgDeep,border:"1px solid "+riskCol}}>{(flight.risk_level||"low").toUpperCase()} RISK</span>
+          {delayMins>0&&<span style={{color:C.amber,fontSize:"11px",fontWeight:700,padding:"3px 8px",background:C.bgDeep,border:"1px solid "+C.amber}}>+{delayMins} MIN EST.</span>}
+          {flight.ctot_regulated&&<span style={{color:C.amber,fontSize:"10px",fontWeight:700,padding:"3px 8px",border:"1px solid "+C.amber,background:C.bgDeep}}>CTOT</span>}
+        </div>
+      </div>
+
+      <div style={{padding:"18px 22px",borderBottom:"1px solid "+C.border,background:C.panel}}>
+        <SectionLabel icon="◎">A-CDM MILESTONE SEQUENCE</SectionLabel>
+        <div style={{display:"flex",alignItems:"flex-start",overflowX:"auto",paddingBottom:4}}>
+          {milestones.map((m,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",flex:i<milestones.length-1?1:"none"}}>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",minWidth:60}}>
+                <div style={{width:14,height:14,borderRadius:"50%",background:m.col,boxShadow:"0 0 16px "+m.col+"60"}}/>
+                <div style={{color:m.col,fontSize:"10px",fontWeight:700,marginTop:7,letterSpacing:"0.08em"}}>{m.label}</div>
+                <div style={{color:m.col,fontSize:"14px",fontFamily:"monospace",marginTop:3,fontWeight:600}}>{m.time}</div>
+                <div style={{color:C.textLo,fontSize:"8px",marginTop:3,textAlign:"center",lineHeight:1.3,maxWidth:56}}>{m.desc}</div>
+              </div>
+              {i<milestones.length-1&&<div style={{flex:1,height:2,background:`linear-gradient(90deg,${milestones[i].col},${milestones[i+1].col})`,opacity:0.35,margin:"0 2px",marginBottom:48,minWidth:14}}/>}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{padding:"16px 22px",borderBottom:"1px solid "+C.border,background:C.panel}}>
+        <SectionLabel icon="▣">DELAY PROBABILITY</SectionLabel>
+        <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:6}}>
+          <div style={{flex:1,height:10,background:C.bgDeep,borderRadius:5,overflow:"hidden",border:"1px solid "+C.border}}>
+            <div style={{width:(flight.delay_probability||0)+"%",height:"100%",background:`linear-gradient(90deg,${C.green},${rc(flight.risk_level)})`,borderRadius:5,boxShadow:"0 0 12px "+rc(flight.risk_level)+"60"}}/>
+          </div>
+          <span style={{color:rc(flight.risk_level),fontSize:"28px",fontWeight:700,minWidth:56,textAlign:"right",lineHeight:1}}>{flight.delay_probability||0}%</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between"}}>
+          {[["LOW",C.green],["MEDIUM",C.amber],["HIGH",C.red]].map(([l,col])=>(
+            <span key={l} style={{color:col,fontSize:"9px",fontWeight:700,letterSpacing:"0.1em"}}>{l}</span>
+          ))}
+        </div>
+      </div>
+
+      <div style={{padding:"16px 22px",borderBottom:"1px solid "+C.border,background:C.panel}}>
+        <SectionLabel icon="⚠">{`ACTIVE RISK FACTORS (${(flight.risk_factors||[]).length})`}</SectionLabel>
+        {!(flight.risk_factors||[]).length&&(
+          <div style={{color:C.green,fontSize:"12px",display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:C.bgDeep,border:"1px solid "+C.green+"44"}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:C.green}}/>NO ACTIVE RISK FACTORS — NOMINAL
+          </div>
+        )}
+        {(flight.risk_factors||[]).map((rf,i)=>{
+          const d=RF[rf];
+          return(
+            <div key={i} style={{marginBottom:8,padding:"10px 12px",background:C.bgDeep,borderLeft:"3px solid "+(d?C.teal:C.border)}}>
+              <div style={{color:d?C.teal:C.textMid,fontSize:"11px",fontWeight:700,letterSpacing:"0.1em",marginBottom:d?6:0}}>{rf}</div>
+              {d&&<>
+                <div style={{color:C.textMid,fontSize:"11px",lineHeight:1.6,marginBottom:6}}>{d.short}</div>
+                <div style={{display:"flex",gap:6,marginBottom:6}}>
+                  <div style={{width:3,flexShrink:0,background:C.amber,borderRadius:2,marginTop:2}}/>
+                  <div style={{color:C.amber,fontSize:"10px",lineHeight:1.5}}><strong>IMPACT:</strong> {d.impact}</div>
+                </div>
+                <div style={{color:C.textLo,fontSize:"9px",fontStyle:"italic"}}>{d.ref}</div>
+              </>}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{padding:"16px 22px",flex:1,background:C.panel}}>
+        <SectionLabel icon="◈">{`${isDep?"DESTINATION":"ORIGIN"} WEATHER — ${remoteAP?remoteAP.name.toUpperCase():(remoteIcao||"UNKNOWN")}`}</SectionLabel>
+        {wxLoading&&<div style={{color:C.teal,fontSize:"11px",letterSpacing:"0.1em",animation:"blink 1s infinite"}}>FETCHING MET DATA...</div>}
+        {!wxLoading&&remoteWx&&(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[
+              ["CONDITIONS",wxDesc,remoteWx.weather_code>=95?C.red:remoteWx.weather_code>=61?C.amber:C.green],
+              ["TEMPERATURE",`${remoteWx.temperature_2m}°C`,C.textHi],
+              ["WIND",`${Math.round(remoteWx.wind_speed_10m)} KMH`,remoteWx.wind_speed_10m>50?C.amber:C.textHi],
+              ["VISIBILITY",`${Math.round(remoteWx.visibility/1000)} KM`,remoteWx.visibility<1000?C.red:remoteWx.visibility<3000?C.amber:C.textHi],
+            ].map(([label,val,col])=>(
+              <div key={label} style={{padding:"10px 12px",background:C.bgDeep,border:"1px solid "+C.border}}>
+                <div style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.12em",fontWeight:700,marginBottom:5}}>{label}</div>
+                <div style={{color:col,fontSize:"16px",fontWeight:700}}>{val}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {!wxLoading&&!remoteWx&&<div style={{color:C.textLo,fontSize:"11px"}}>MET DATA UNAVAILABLE</div>}
+      </div>
+
+      <div style={{padding:"10px 22px",borderTop:"1px solid "+C.border,background:C.surface,flexShrink:0}}>
+        <div style={{color:C.textLo,fontSize:"8px",letterSpacing:"0.1em",textAlign:"center"}}>A-CDM DATA · ANTHROPIC AI INFERENCE · OPEN-METEO</div>
+      </div>
+    </div>
+  );
+}
+
+// ── METRICS DASHBOARD ─────────────────────────────────────────────────────────
+function MetricsDashboard({deps,arrs,selAP}){
+  const all=[...deps,...arrs];
+  if(!all.length) return <div style={{padding:48,textAlign:"center",color:C.textLo,fontSize:"12px"}}>NO DATA — RUN A PREDICTION FIRST</div>;
+
+  const low=all.filter(f=>f.risk_level==="low").length;
+  const med=all.filter(f=>f.risk_level==="medium").length;
+  const high=all.filter(f=>f.risk_level==="high").length;
+  const total=all.length;
+  const onTime=Math.round((low/total)*100);
+  const regulated=deps.filter(f=>f.ctot_regulated).length;
+  const avgDelay=Math.round(all.reduce((s,f)=>s+(f.estimated_delay_minutes||0),0)/total);
+
+  const factorCount={};
+  all.forEach(f=>(f.risk_factors||[]).forEach(rf=>{factorCount[rf]=(factorCount[rf]||0)+1;}));
+  const factorData=Object.entries(factorCount).sort((a,b)=>b[1]-a[1]).slice(0,7).map(([name,count])=>({name:name.replace(/ /g,"_").slice(0,12),full:name,count}));
+
+  const pieData=[{name:"LOW",value:low,col:C.green},{name:"MED",value:med,col:C.amber},{name:"HIGH",value:high,col:C.red}].filter(d=>d.value>0);
+
+  const alMap={};
+  all.forEach(f=>{const cs=parseCS(f.callsign);const key=cs.airline;if(!alMap[key])alMap[key]={name:key,total:0,delay:0,high:0};alMap[key].total++;alMap[key].delay+=(f.delay_probability||0);if(f.risk_level==="high")alMap[key].high++;});
+  const alData=Object.values(alMap).sort((a,b)=>b.delay/b.total-a.delay/a.total).slice(0,8).map(a=>({...a,avg:Math.round(a.delay/a.total)}));
+
+  const bins=[0,0,0,0,0];
+  all.forEach(f=>{const d=f.estimated_delay_minutes||0;if(d<=5)bins[0]++;else if(d<=15)bins[1]++;else if(d<=30)bins[2]++;else if(d<=60)bins[3]++;else bins[4]++;});
+  const delayDist=[
+    {name:"<5M",count:bins[0],col:C.green},{name:"5-15M",count:bins[1],col:"#80D080"},
+    {name:"15-30M",count:bins[2],col:C.amber},{name:"30-60M",count:bins[3],col:"#FF7040"},{name:">60M",count:bins[4],col:C.red},
+  ];
+
+  const TICK={fill:C.textLo,fontSize:9,fontFamily:"'Barlow Condensed',Arial,sans-serif",fontWeight:700};
+  const CTip=({active,payload,label})=>{
+    if(!active||!payload||!payload.length) return null;
+    return(
+      <div style={{background:C.surface,border:"1px solid "+C.teal,padding:"8px 12px",fontSize:"11px",color:C.textHi}}>
+        <div style={{color:C.teal,fontWeight:700,marginBottom:3}}>{payload[0].payload.full||label}</div>
+        <div style={{color:C.textMid}}>{payload[0].name}: <strong style={{color:C.textHi}}>{payload[0].value}</strong></div>
+      </div>
+    );
+  };
+
+  return(
+    <div style={{padding:"20px 24px",backgroundImage:DOT_BG,backgroundSize:"24px 24px"}}>
+      <SectionLabel icon="◈">OPERATIONAL PERFORMANCE — {selAP}</SectionLabel>
+      <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+        <KPICard label="ON-TIME RATE" value={onTime+"%"} sub={`${low} of ${total} movements`} col={onTime>70?C.green:onTime>50?C.amber:C.red}/>
+        <KPICard label="HIGH RISK MVMTS" value={String(high)} sub={`${Math.round(high/total*100)}% of total`} col={high>0?C.red:C.green}/>
+        <KPICard label="AVG EST. DELAY" value={avgDelay+"M"} sub="all movements" col={avgDelay>20?C.amber:C.green}/>
+        <KPICard label="CTOT REGULATED" value={String(regulated)} sub="departure slots" col={regulated>0?C.amber:C.textLo}/>
+        <KPICard label="TOTAL MOVEMENTS" value={String(total)} sub={`${deps.length} dep · ${arrs.length} arr`} col={C.teal}/>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>RISK DISTRIBUTION</div>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <PieChart width={130} height={130}>
+              <Pie data={pieData} cx={60} cy={60} innerRadius={38} outerRadius={60} paddingAngle={3} dataKey="value" strokeWidth={0}>
+                {pieData.map((entry,i)=><Cell key={i} fill={entry.col}/>)}
+              </Pie>
+            </PieChart>
+            <div style={{flex:1}}>
+              {pieData.map(d=>(
+                <div key={d.name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                  <div style={{width:10,height:10,borderRadius:2,background:d.col,flexShrink:0}}/>
+                  <span style={{color:C.textMid,fontSize:"11px",flex:1}}>{d.name}</span>
+                  <span style={{color:d.col,fontSize:"13px",fontWeight:700}}>{d.value}</span>
+                  <span style={{color:C.textLo,fontSize:"9px"}}>{Math.round(d.value/total*100)}%</span>
+                </div>
+              ))}
+              <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid "+C.border,display:"flex",alignItems:"center",gap:8}}>
+                <span style={{color:C.textLo,fontSize:"9px",flex:1}}>TOTAL</span>
+                <span style={{color:C.textHi,fontSize:"14px",fontWeight:700}}>{total}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>DELAY DISTRIBUTION</div>
+          <ResponsiveContainer width="100%" height={118}>
+            <BarChart data={delayDist} barCategoryGap="20%">
+              <CartesianGrid strokeDasharray="2 4" stroke={C.borderS} vertical={false}/>
+              <XAxis dataKey="name" tick={TICK} axisLine={false} tickLine={false}/>
+              <YAxis tick={TICK} axisLine={false} tickLine={false} width={20}/>
+              <RChartTip content={<CTip/>}/>
+              <Bar dataKey="count" radius={[2,2,0,0]} name="Flights">
+                {delayDist.map((e,i)=><Cell key={i} fill={e.col}/>)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:16,marginBottom:16}}>
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:14}}>DELAY FACTOR FREQUENCY</div>
+          {factorData.length===0?<div style={{color:C.textLo,fontSize:"11px",padding:"20px 0",textAlign:"center"}}>NO RISK FACTORS RECORDED</div>:(
+            <ResponsiveContainer width="100%" height={160}>
+              <BarChart data={factorData} layout="vertical" barCategoryGap="15%">
+                <CartesianGrid strokeDasharray="2 4" stroke={C.borderS} horizontal={false}/>
+                <XAxis type="number" tick={TICK} axisLine={false} tickLine={false}/>
+                <YAxis dataKey="name" type="category" tick={TICK} axisLine={false} tickLine={false} width={80}/>
+                <RChartTip content={<CTip/>}/>
+                <Bar dataKey="count" fill={C.teal} radius={[0,2,2,0]} name="Occurrences" opacity={0.85}/>
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+
+        <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,padding:"16px",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em",marginBottom:12}}>ON-TIME RATE</div>
+          <div style={{position:"relative",display:"inline-flex",alignItems:"center",justifyContent:"center"}}>
+            <RadialBarChart width={140} height={140} cx={70} cy={70} innerRadius={46} outerRadius={64} startAngle={220} endAngle={-40} data={[{value:onTime}]}>
+              <RadialBar background={{fill:"rgba(255,255,255,0.05)"}} dataKey="value" fill={onTime>70?C.green:onTime>50?C.amber:C.red} cornerRadius={4}/>
+            </RadialBarChart>
+            <div style={{position:"absolute",textAlign:"center"}}>
+              <div style={{color:onTime>70?C.green:onTime>50?C.amber:C.red,fontSize:"26px",fontWeight:700,lineHeight:1}}>{onTime}%</div>
+              <div style={{color:C.textLo,fontSize:"8px",marginTop:2,letterSpacing:"0.1em"}}>ON-TIME</div>
+            </div>
+          </div>
+          <div style={{marginTop:10,textAlign:"center"}}>
+            <div style={{color:C.textLo,fontSize:"9px"}}>Target: <span style={{color:C.textMid,fontWeight:700}}>80%+</span></div>
+            <div style={{color:onTime>=80?C.green:C.amber,fontSize:"10px",fontWeight:700,marginTop:3}}>{onTime>=80?"✓ MEETING TARGET":"⚠ BELOW TARGET"}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border}}>
+        <div style={{padding:"12px 16px",borderBottom:"1px solid "+C.border}}>
+          <div style={{color:C.textLo,fontSize:"9px",fontWeight:700,letterSpacing:"0.16em"}}>AIRLINE DELAY RANKING — CURRENT SESSION</div>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px"}}>
+          <thead>
+            <tr>{["AIRLINE","MOVEMENTS","AVG DELAY %","HIGH RISK","PERFORMANCE"].map(h=>(
+              <th key={h} style={{color:C.textLo,padding:"7px 14px",textAlign:"left",borderBottom:"1px solid "+C.border,fontWeight:700,letterSpacing:"0.1em",fontSize:"9px",background:C.surface,whiteSpace:"nowrap"}}>{h}</th>
+            ))}</tr>
+          </thead>
+          <tbody>
+            {alData.map((a,i)=>{
+              const perf=a.avg<30?"NOMINAL":a.avg<60?"MONITORING":"CRITICAL";
+              const pc=perf==="NOMINAL"?C.green:perf==="MONITORING"?C.amber:C.red;
+              return(
+                <tr key={i} style={{borderBottom:"1px solid "+C.borderS}}>
+                  <td style={{padding:"8px 14px",color:C.textHi,fontWeight:600}}>{a.name}</td>
+                  <td style={{padding:"8px 14px",color:C.textMid}}>{a.total}</td>
+                  <td style={{padding:"8px 14px"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:7}}>
+                      <div style={{width:50,height:4,background:"rgba(255,255,255,0.08)",borderRadius:2}}>
+                        <div style={{width:a.avg+"%",height:"100%",background:rc(a.avg>60?"high":a.avg>30?"medium":"low"),borderRadius:2}}/>
+                      </div>
+                      <span style={{color:rc(a.avg>60?"high":a.avg>30?"medium":"low"),fontWeight:700,fontSize:"11px"}}>{a.avg}%</span>
+                    </div>
+                  </td>
+                  <td style={{padding:"8px 14px",color:a.high>0?C.red:C.green,fontWeight:700}}>{a.high}</td>
+                  <td style={{padding:"8px 14px"}}><span style={{color:pc,fontSize:"9px",fontWeight:700,padding:"2px 7px",border:"1px solid "+pc,background:pc+"14"}}>{perf}</span></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{marginTop:20,padding:"16px",background:"rgba(0,0,0,0.2)",border:"1px solid "+C.border}}>
+        <SectionLabel>A-CDM MILESTONE METHODOLOGY</SectionLabel>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:"11px",marginBottom:12}}>
+          <thead><tr>{["MILESTONE","FORMULA","REFERENCE"].map(h=><th key={h} style={{color:C.textLo,padding:"5px 10px",textAlign:"left",borderBottom:"1px solid "+C.border,fontWeight:700,letterSpacing:"0.1em",fontSize:"9px"}}>{h}</th>)}</tr></thead>
+          <tbody>{CDM_SRC.map((row,i)=>(
+            <tr key={i} style={{borderBottom:"1px solid "+C.borderS}}>
+              <td style={{padding:"6px 10px",color:C.teal,fontWeight:700,whiteSpace:"nowrap"}}>{row.m}</td>
+              <td style={{padding:"6px 10px",color:C.textHi,fontFamily:"monospace",whiteSpace:"nowrap"}}>{row.f}</td>
+              <td style={{padding:"6px 10px",color:C.textMid,lineHeight:1.5}}>{row.src}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:"6px 28px"}}>
+          {GLOSSARY.map((g,i)=>(
+            <div key={i} style={{display:"flex",gap:10,fontSize:"11px",alignItems:"baseline"}}>
+              <span style={{color:C.teal,fontWeight:700,minWidth:38,letterSpacing:"0.06em"}}>{g.term}</span>
+              <span style={{color:C.textMid}}>{g.def}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── NOTAM FEED ────────────────────────────────────────────────────────────────
+function NOTAMFeed({notams,loading,selAP,apName}){
+  const [filter,setFilter]=useState("ALL");
+  const cats=["ALL",...new Set((notams||[]).map(n=>n.category))];
+  const filtered=filter==="ALL"?notams:(notams||[]).filter(n=>n.category===filter);
+  const highCount=(notams||[]).filter(n=>n.severity==="high").length;
+
+  return(
+    <div style={{padding:"20px 24px",backgroundImage:DOT_BG,backgroundSize:"24px 24px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{flex:1}}><SectionLabel icon="◉">{`NOTAM FEED — ${apName||selAP} (${selAP})`}</SectionLabel></div>
+        {highCount>0&&(
+          <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",background:"rgba(255,58,58,0.1)",border:"1px solid rgba(255,58,58,0.3)"}}>
+            <div style={{width:6,height:6,borderRadius:"50%",background:C.red,animation:"blink 1.5s infinite"}}/>
+            <span style={{color:C.red,fontSize:"9px",fontWeight:700}}>{highCount} CRITICAL</span>
+          </div>
+        )}
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+        {cats.map(cat=>{
+          const catDef=NOTAM_CATS[cat];
+          const isActive=filter===cat;
+          const col=catDef?catDef.col:C.textMid;
+          return(
+            <button key={cat} onClick={()=>setFilter(cat)}
+              style={{background:isActive?(col+"20"):"rgba(0,0,0,0.2)",border:"1px solid "+(isActive?col:C.border),color:isActive?col:C.textLo,padding:"4px 12px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"10px",fontWeight:700,letterSpacing:"0.1em",cursor:"pointer"}}>
+              {catDef?`${catDef.icon} ${catDef.label}`:cat}
+            </button>
+          );
+        })}
+      </div>
+      {loading&&<div style={{padding:"32px",textAlign:"center",color:C.teal,fontSize:"11px",letterSpacing:"0.12em",animation:"blink 1s infinite",fontWeight:700}}>FETCHING NOTAM DATA...</div>}
+      {!loading&&(!notams||!notams.length)&&<div style={{padding:"32px",textAlign:"center",color:C.textLo,fontSize:"11px"}}>NO NOTAMS — RUN A PREDICTION TO LOAD</div>}
+      {!loading&&filtered&&filtered.length>0&&(
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {filtered.map((n,i)=>{
+            const catDef=NOTAM_CATS[n.category]||{col:C.textMid,label:n.category,icon:"◦"};
+            const sevCol=n.severity==="high"?C.red:n.severity==="medium"?C.amber:C.green;
+            return(
+              <div key={i} style={{background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,borderLeft:"3px solid "+catDef.col,padding:"12px 16px"}}
+                onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,0.5)"}
+                onMouseLeave={e=>e.currentTarget.style.background="rgba(0,0,0,0.3)"}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:8}}>
+                  <span style={{color:catDef.col,fontSize:"10px",fontWeight:700,padding:"2px 6px",background:catDef.col+"18",border:"1px solid "+catDef.col+"40",flexShrink:0}}>{catDef.icon} {catDef.label}</span>
+                  <div style={{flex:1,color:C.textHi,fontSize:"12px",fontWeight:700,lineHeight:1.3}}>{n.subject}</div>
+                  <span style={{color:sevCol,fontSize:"9px",fontWeight:700,padding:"2px 6px",border:"1px solid "+sevCol,flexShrink:0}}>{(n.severity||"low").toUpperCase()}</span>
+                </div>
+                <div style={{color:C.textMid,fontSize:"11px",lineHeight:1.6,marginBottom:8}}>{n.description}</div>
+                <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+                  <div style={{fontFamily:"monospace",fontSize:"10px",color:C.textLo,background:"rgba(0,0,0,0.3)",padding:"2px 8px",border:"1px solid "+C.borderS}}>{n.raw_notam||`${selAP} NOTAM ${String(i+1).padStart(4,"0")}/26`}</div>
+                  <div style={{fontSize:"9px",color:C.textLo,marginLeft:"auto",display:"flex",gap:8}}>
+                    <span>FROM: <strong style={{color:C.textMid}}>{n.valid_from||"--:--"}</strong></span>
+                    <span>TO: <strong style={{color:n.valid_to==="PERM"?C.red:C.textMid}}>{n.valid_to||"--:--"}</strong></span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── STATS STRIP ───────────────────────────────────────────────────────────────
+function StatsStrip({deps,arrs}){
+  const all=[...deps,...arrs];
+  const highRisk=all.filter(f=>f.risk_level==="high").length;
+  const regulated=deps.filter(f=>f.ctot_regulated).length;
+  const avgDelay=all.length?Math.round(all.reduce((s,f)=>s+(f.estimated_delay_minutes||0),0)/all.length):0;
+  const destCounts=deps.reduce((acc,f)=>{const k=f.destination_name||f.dest_icao||"---";acc[k]=(acc[k]||0)+1;return acc;},{});
+  const topRoute=Object.entries(destCounts).sort((a,b)=>b[1]-a[1])[0];
+  return(
+    <div style={{display:"flex",background:"rgba(0,0,0,0.3)",borderBottom:"1px solid "+C.border,padding:"5px 24px",overflowX:"auto",flexShrink:0}}>
+      {[
+        {label:"HIGH RISK MVMTS",val:highRisk,sub:all.length?Math.round(highRisk/all.length*100)+"%":"0%",col:highRisk>0?C.red:C.green},
+        {label:"CTOT REGULATED",val:regulated,sub:"departures",col:regulated>0?C.amber:C.textLo},
+        {label:"AVG EST. DELAY",val:avgDelay+"M",sub:"all movements",col:avgDelay>20?C.amber:C.green},
+        {label:"BUSIEST ROUTE",val:topRoute?topRoute[0]:"---",sub:topRoute?topRoute[1]+" flt(s)":"",col:C.teal},
+      ].map((item,i)=>(
+        <div key={i} style={{padding:"6px 20px",borderRight:"1px solid "+C.border,display:"flex",flexDirection:"column",justifyContent:"center",minWidth:120,flexShrink:0}}>
+          <div style={{color:C.textLo,fontSize:"8px",fontWeight:700,letterSpacing:"0.14em",marginBottom:2}}>{item.label}</div>
+          <div style={{color:item.col,fontSize:"14px",fontWeight:700,lineHeight:1}}>{item.val}</div>
+          {item.sub&&<div style={{color:C.textLo,fontSize:"9px",marginTop:1}}>{item.sub}</div>}
+        </div>
+      ))}
+      <div style={{marginLeft:"auto",padding:"5px 0",display:"flex",alignItems:"center",gap:6}}>
+        <div style={{width:6,height:6,borderRadius:"50%",background:C.green,animation:"blink 2.5s infinite"}}/>
+        <span style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.1em",fontWeight:700}}>LIVE PREDICTIONS</span>
+      </div>
+    </div>
+  );
+}
+
+// ── ALERT TICKER ──────────────────────────────────────────────────────────────
+function AlertTicker({flights}){
+  if(!flights||!flights.length) return null;
+  const highFlights=flights.filter(f=>f.risk_level==="high");
+  const regulated=flights.filter(f=>f.ctot_regulated);
+  if(!highFlights.length&&!regulated.length) return null;
+  const alerts=[];
+  highFlights.forEach(f=>{const cs=parseCS(f.callsign);alerts.push(`⚠ HIGH RISK  ${cs.flight}  →  ${f.destination_name||f.dest_icao||"---"}  [${(f.risk_factors||[]).join(", ")}]`);});
+  regulated.forEach(f=>{const cs=parseCS(f.callsign);alerts.push(`◈ CTOT REGULATED  ${cs.flight}  →  ${f.destination_name||f.dest_icao||"---"}  [SLOT: ${f.times.CTOT}]`);});
+  const text=alerts.join("     ·     ")+"     ·     "+alerts.join("     ·     ");
+  return(
+    <div style={{background:"rgba(255,58,58,0.08)",borderBottom:"1px solid rgba(255,58,58,0.25)",overflow:"hidden",height:26,display:"flex",alignItems:"center",flexShrink:0}}>
+      <div style={{background:C.red,color:"#fff",fontSize:"8px",fontWeight:700,letterSpacing:"0.16em",padding:"0 12px",height:"100%",display:"flex",alignItems:"center",flexShrink:0}}>ALERTS</div>
+      <div style={{overflow:"hidden",flex:1}}>
+        <div style={{display:"inline-block",whiteSpace:"nowrap",color:C.red,fontSize:"10px",fontWeight:700,letterSpacing:"0.06em",animation:"ticker 32s linear infinite",paddingLeft:"100%"}}>{text}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── MAP PANEL — d3 SVG with drag-to-pan + scroll-to-zoom ─────────────────────
+function MapPanel({ap,selAP,routes,isDep}){
+  const containerRef=useRef(null);
+  const [world,setWorld]=useState(null);
+  const [topoLib,setTopoLib]=useState(null);
+  const [mapErr,setMapErr]=useState(null);
+  const [w,setW]=useState(900);
+  const H=420;
+
+  // Pan + zoom state
+  const [tx,setTx]=useState(0);
+  const [ty,setTy]=useState(0);
+  const [scale,setScale]=useState(1);
+  const dragRef=useRef(null);
+  const [dragging,setDragging]=useState(false);
+  const [tip,setTip]=useState(null);
+  // Refs so wheel handler always reads latest values without stale closure
+  const stateRef=useRef({tx:0,ty:0,scale:1});
+  useEffect(()=>{ stateRef.current={tx,ty,scale}; },[tx,ty,scale]);
+
+  // Reset view when airport changes
+  useEffect(()=>{ setTx(0); setTy(0); setScale(1); },[ap]);
+
+  // Drag handlers
+  const onMouseDown=e=>{
+    if(e.button!==0) return;
+    dragRef.current={startX:e.clientX,startY:e.clientY,startTx:stateRef.current.tx,startTy:stateRef.current.ty};
+    setDragging(true); e.preventDefault();
+  };
+  const onMouseMove=e=>{
+    if(!dragRef.current) return;
+    setTx(dragRef.current.startTx+(e.clientX-dragRef.current.startX));
+    setTy(dragRef.current.startTy+(e.clientY-dragRef.current.startY));
+  };
+  const onMouseUp=()=>{ dragRef.current=null; setDragging(false); };
+
+  // Wheel zoom toward cursor — use ref for fresh values, no stale closure
+  useEffect(()=>{
+    const el=containerRef.current; if(!el) return;
+    const handler=e=>{
+      e.preventDefault();
+      const rect=el.getBoundingClientRect();
+      const mx=e.clientX-rect.left;
+      const my=e.clientY-rect.top;
+      const dz=e.deltaY<0?1.15:1/1.15;
+      const {tx:cx,ty:cy,scale:cs}=stateRef.current;
+      const newScale=Math.max(0.35,Math.min(10,cs*dz));
+      const factor=newScale/cs;
+      setScale(newScale);
+      setTx(mx+(cx-mx)*factor);
+      setTy(my+(cy-my)*factor);
+    };
+    el.addEventListener("wheel",handler,{passive:false});
+    return()=>el.removeEventListener("wheel",handler);
+  },[]); // mount once — stateRef always has fresh values
+
+  // Track container width
+  useEffect(()=>{
+    if(!containerRef.current) return;
+    const ro=new ResizeObserver(entries=>{
+      const width=entries[0].contentRect.width;
+      if(width>0) setW(width);
+    });
+    ro.observe(containerRef.current);
+    setW(containerRef.current.getBoundingClientRect().width||900);
+    return()=>ro.disconnect();
+  },[]);
+
+  // Base projection — pan/zoom applied via <g> transform, not here
+  const proj=useMemo(()=>{
+    if(!ap) return null;
+    return d3.geoNaturalEarth1()
+      .rotate([-ap.lon,-ap.lat/3])
+      .scale(w/6.2)
+      .translate([w/2, H/2])
+      .precision(0.1);   // smoother curves at high latitudes
+  },[ap,w]);
+
+  const path=useMemo(()=>proj?d3.geoPath(proj):null,[proj]);
+
+  // Sphere path string — used both for rendering and as a clip shape
+  const sphereD=useMemo(()=>{
+    if(!path) return "";
+    try{ return path({type:"Sphere"})||""; }catch{ return ""; }
+  },[path]);
+
+  // Country fills — clipped to sphere to eliminate polar artifacts
+  const countryPaths=useMemo(()=>{
+    if(!world||!topoLib||!path) return null;
+    try{
+      return topoLib.feature(world,world.objects.countries).features.map((f,i)=>(
+        <path key={i} d={path(f)||""} fill="#0A1A26" stroke="#152030" strokeWidth={0.4}/>
+      ));
+    }catch{ return null; }
+  },[world,topoLib,path]);
+
+  const grat=useMemo(()=>{
+    if(!path) return null;
+    try{ return <path d={path(d3.geoGraticule()())||""} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={0.5}/>; }
+    catch{ return null; }
+  },[path]);
+
+  const hubPt=proj&&ap?proj([ap.lon,ap.lat]):null;
+
+  // Tick every second to animate aircraft positions
+  const [tick,setTick]=useState(0);
+  useEffect(()=>{
+    const iv=setInterval(()=>setTick(t=>t+1),1000);
+    return()=>clearInterval(iv);
+  },[]);
+
+  // Compute aircraft progress fraction (0–1) along the route
+  // Deps: TTOT = tobt + taxi; flight duration estimated from great-circle distance
+  // Arrs: STA/ETA available as offsets
+  function routeProgress(item){
+    const f=item.f;
+    const nowMin=0; // all offsets are relative to now=0
+    if(isDep){
+      const ttot=(f.eobt_offset||0)+(f.tobt_delta||0)+(f.taxi_minutes||18)+(f.ctot_regulated?(f.ctot_delta||0):0);
+      // crude cruise speed: 850 km/h → dist/850*60 minutes flight time
+      const R=6371;
+      const toRad=d=>d*Math.PI/180;
+      const dlat=toRad(item.ap.lat-ap.lat),dlon=toRad(item.ap.lon-ap.lon);
+      const a=Math.sin(dlat/2)**2+Math.cos(toRad(ap.lat))*Math.cos(toRad(item.ap.lat))*Math.sin(dlon/2)**2;
+      const distKm=2*R*Math.asin(Math.sqrt(a));
+      const flightMins=distKm/850*60;
+      const eta=ttot+flightMins;
+      if(nowMin<ttot) return -1;           // not departed yet
+      return Math.min(1,(nowMin-ttot)/(eta-ttot));
+    } else {
+      const sta=f.sta_offset||0;
+      const eta=sta+(f.eta_delta||0);
+      const departed=eta-45;               // assume ~45min before ETA
+      if(nowMin<departed) return -1;
+      return Math.min(1,Math.max(0,(nowMin-departed)/(eta-departed)));
+    }
+  }
+
+  // Compute bearing between two projected points for icon rotation
+  function bearing(lon1,lat1,lon2,lat2){
+    const toR=d=>d*Math.PI/180;
+    const dLon=toR(lon2-lon1);
+    const y=Math.sin(dLon)*Math.cos(toR(lat2));
+    const x=Math.cos(toR(lat1))*Math.sin(toR(lat2))-Math.sin(toR(lat1))*Math.cos(toR(lat2))*Math.cos(dLon);
+    return (Math.atan2(y,x)*180/Math.PI+360)%360;
+  }
+
+  // Route arcs + sleek markers + aircraft
+  const routeEls=useMemo(()=>{
+    if(!proj||!path||!ap) return [];
+    return routes.map((item,i)=>{
+      const col=rc(item.f.risk_level);
+      const destPt=proj([item.ap.lon,item.ap.lat]);
+      if(!destPt) return null;
+      let arcD="";
+      try{ arcD=path({type:"Feature",geometry:{type:"LineString",coordinates:[[ap.lon,ap.lat],[item.ap.lon,item.ap.lat]]}})||""; }
+      catch{ return null; }
+      const cs=parseCS(item.f.callsign).flight;
+      const label=isDep?`${cs} → ${item.f.destination_name||item.ap.city}`:`${cs} ← ${item.f.origin_name||item.ap.city}`;
+
+      // Aircraft position along great circle
+      const t=routeProgress(item);
+      let planePt=null, planeBearing=0;
+      if(t>=0&&t<=1){
+        const srcLon=isDep?ap.lon:item.ap.lon, srcLat=isDep?ap.lat:item.ap.lat;
+        const dstLon=isDep?item.ap.lon:ap.lon, dstLat=isDep?item.ap.lat:ap.lat;
+        const interp=d3.geoInterpolate([srcLon,srcLat],[dstLon,dstLat]);
+        const [iLon,iLat]=interp(t);
+        planePt=proj([iLon,iLat]);
+        // Bearing: step slightly ahead for heading
+        const [aLon,aLat]=interp(Math.min(t+0.02,1));
+        const aPt=proj([aLon,aLat]);
+        if(planePt&&aPt) planeBearing=Math.atan2(aPt[1]-planePt[1],aPt[0]-planePt[0])*180/Math.PI+90;
+      }
+
+      // Sleek marker: scales inversely with zoom
+      const r=5/scale;
+      const rDot=1.8/scale;
+      const sw=1.2/scale;
+      const hitR=12/scale;
+
+      return(
+        <g key={i}>
+          {/* Arc */}
+          <path d={arcD} fill="none" stroke={col} strokeWidth={1.4/scale} opacity={0.7}
+            strokeDasharray={isDep?undefined:`${5/scale},${4/scale}`}/>
+
+          {/* Destination marker — sleek ring + centre dot, shrinks with zoom */}
+          <circle cx={destPt[0]} cy={destPt[1]} r={r} fill="none" stroke={col} strokeWidth={sw} opacity={0.9}/>
+          <circle cx={destPt[0]} cy={destPt[1]} r={rDot} fill={col}/>
+          {/* Transparent hit area */}
+          <circle cx={destPt[0]} cy={destPt[1]} r={hitR} fill="transparent"
+            onMouseEnter={e=>setTip({x:e.clientX,y:e.clientY,label,col})}
+            onMouseLeave={()=>setTip(null)}/>
+
+          {/* Aircraft icon at interpolated position */}
+          {planePt&&(
+            <g transform={`translate(${planePt[0]},${planePt[1]}) rotate(${planeBearing})`}>
+              {/* Glow */}
+              <circle r={7/scale} fill={col} opacity={0.15}/>
+              {/* Plane shape */}
+              <g transform={`scale(${1/scale})`}>
+                <polygon points="0,-6 2,3 0,1.5 -2,3" fill="#FFFFFF" opacity={0.95}/>
+                <rect x="-3.5" y="0.5" width="7" height="1.2" rx="0.6" fill="#FFFFFF" opacity={0.8}/>
+                <rect x="-1.5" y="2.5" width="3" height="0.8" rx="0.4" fill="#FFFFFF" opacity={0.6}/>
+              </g>
+            </g>
+          )}
+        </g>
+      );
+    }).filter(Boolean);
+  // tick in deps so aircraft positions re-compute every second
+  },[routes,proj,path,ap,isDep,scale,tick]);
+
+  // Load world atlas once
+  useEffect(()=>{
+    if(window.topojson){
+      setTopoLib(window.topojson);
+      fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json")
+        .then(r=>r.json()).then(setWorld).catch(()=>setMapErr("Could not load map data"));
+      return;
+    }
+    const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js";
+    s.onload=()=>{
+      setTopoLib(window.topojson);
+      fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json")
+        .then(r=>r.json()).then(setWorld).catch(()=>setMapErr("Could not load map data"));
+    };
+    s.onerror=()=>setMapErr("Could not load map library");
+    document.head.appendChild(s);
+  },[]);
+
+  const zoomBtn=(lbl,action)=>(
+    <button onClick={action}
+      style={{background:"rgba(0,0,0,0.45)",border:"1px solid "+C.border,color:C.textMid,
+        width:24,height:24,cursor:"pointer",fontFamily:"monospace",fontSize:"14px",
+        display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1,flexShrink:0}}
+      onMouseEnter={e=>{e.currentTarget.style.borderColor=C.teal;e.currentTarget.style.color=C.teal;}}
+      onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border;e.currentTarget.style.color=C.textMid;}}>
+      {lbl}
+    </button>
+  );
+
+  return(
+    <div style={{borderTop:"1px solid "+C.border,borderBottom:"1px solid "+C.border}}>
+      {/* Header */}
+      <div style={{padding:"7px 20px",background:C.surface,borderBottom:"1px solid "+C.border,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+        <div style={{width:3,height:16,background:C.teal,flexShrink:0,borderRadius:2}}/>
+        <span style={{color:C.textHi,fontSize:"11px",fontWeight:700,letterSpacing:"0.14em"}}>{isDep?"DEPARTURES":"ARRIVALS"} — ROUTE MAP</span>
+        <span style={{background:C.tealDim,color:C.teal,fontSize:"9px",fontWeight:700,padding:"1px 7px",marginLeft:2}}>{routes.length} ROUTES</span>
+        <div style={{marginLeft:"auto",display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+          {isDep&&[["LOW",C.green],["MED",C.amber],["HIGH",C.red]].map(([l,col])=>(
+            <div key={l} style={{display:"flex",alignItems:"center",gap:5}}>
+              <div style={{width:22,height:2.5,background:col,borderRadius:2}}/>
+              <span style={{color:C.textMid,fontSize:"9px",fontWeight:700}}>{l}</span>
+            </div>
+          ))}
+          {!isDep&&<div style={{display:"flex",alignItems:"center",gap:5}}>
+            <div style={{width:22,height:0,borderTop:"2px dashed #3366DD"}}/>
+            <span style={{color:C.textMid,fontSize:"9px",fontWeight:700}}>INBOUND</span>
+          </div>}
+          <div style={{display:"flex",alignItems:"center",gap:5}}>
+            <div style={{width:10,height:10,borderRadius:"50%",background:C.raised,border:"2px solid "+C.teal}}/>
+            <span style={{color:C.textMid,fontSize:"9px",fontWeight:700}}>HUB</span>
+          </div>
+          <div style={{display:"flex",gap:3,marginLeft:4}}>
+            {zoomBtn("+",()=>{const dz=1.3;setScale(s=>Math.min(10,s*dz));setTx(p=>w/2+(p-w/2)*dz);setTy(p=>H/2+(p-H/2)*dz);})}
+            {zoomBtn("−",()=>{const dz=1/1.3;setScale(s=>Math.max(0.35,s*dz));setTx(p=>w/2+(p-w/2)*dz);setTy(p=>H/2+(p-H/2)*dz);})}
+            {zoomBtn("⟳",()=>{setScale(1);setTx(0);setTy(0);})}
+          </div>
+          <span style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.06em",fontFamily:"monospace"}}>{scale.toFixed(2)}×</span>
+          <span style={{color:C.textLo,fontSize:"9px"}}>DRAG · SCROLL ZOOM · HOVER MARKER</span>
+        </div>
+      </div>
+
+      {/* Map canvas */}
+      <div
+        ref={containerRef}
+        style={{width:"100%",height:H,background:"#030A10",position:"relative",overflow:"hidden",
+          cursor:dragging?"grabbing":"grab",userSelect:"none"}}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={e=>{ onMouseUp(); setTip(null); }}
+      >
+        {!world&&!mapErr&&(
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",
+            color:C.teal,fontSize:"11px",fontWeight:700,letterSpacing:"0.14em",animation:"blink 1s infinite",pointerEvents:"none"}}>
+            LOADING MAP DATA...
+          </div>
+        )}
+        {mapErr&&(
+          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,pointerEvents:"none"}}>
+            <div style={{color:C.red,fontSize:"11px",fontWeight:700}}>MAP DATA UNAVAILABLE</div>
+            <div style={{color:C.textLo,fontSize:"10px"}}>{mapErr}</div>
+          </div>
+        )}
+
+        {proj&&(
+          <svg width={w} height={H} style={{display:"block",position:"absolute",inset:0,overflow:"visible"}}>
+            <defs>
+              <filter id="hub-glow" x="-60%" y="-60%" width="220%" height="220%">
+                <feGaussianBlur stdDeviation="3" result="blur"/>
+                <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+              <clipPath id="map-clip"><rect x={0} y={0} width={w} height={H}/></clipPath>
+              {/* Sphere clip: constrains country polygons to the projected sphere outline,
+                  eliminating artifact lines from polar/antimeridian geometries */}
+              {sphereD&&<clipPath id="sphere-clip"><path d={sphereD}/></clipPath>}
+            </defs>
+            <g transform={`translate(${tx},${ty}) scale(${scale})`} clipPath="url(#map-clip)">
+              {/* Ocean fill */}
+              {sphereD&&<path d={sphereD} fill="#030A10" stroke="#0D1E2E" strokeWidth={0.8}/>}
+              {/* Graticule inside sphere */}
+              <g clipPath="url(#sphere-clip)">{grat}</g>
+              {/* Countries clipped to sphere — this is the key fix for North Europe */}
+              <g clipPath="url(#sphere-clip)">{countryPaths}</g>
+              {/* Sphere border on top */}
+              {sphereD&&<path d={sphereD} fill="none" stroke="#2A3A6A" strokeWidth={1}/>}
+              {routeEls}
+              {hubPt&&(
+                <g filter="url(#hub-glow)">
+                  <circle cx={hubPt[0]} cy={hubPt[1]} r={16/scale} fill="none" stroke={C.teal} strokeWidth={1.2/scale} opacity={0.35}/>
+                  <circle cx={hubPt[0]} cy={hubPt[1]} r={9/scale} fill={C.raised} stroke={C.teal} strokeWidth={2.5/scale}/>
+                  <circle cx={hubPt[0]} cy={hubPt[1]} r={3.5/scale} fill={C.teal}/>
+                  <text x={hubPt[0]} y={hubPt[1]-20/scale} fill={C.teal} fontSize={12/scale} fontWeight={700}
+                    textAnchor="middle" fontFamily="'Barlow Condensed',Arial,sans-serif">{selAP}</text>
+                </g>
+              )}
+            </g>
+          </svg>
+        )}
+
+        {tip&&(
+          <div style={{position:"fixed",left:Math.min(tip.x+14,window.innerWidth-240),top:tip.y-40,zIndex:9000,
+            background:C.raised,border:"1px solid "+(tip.col||C.teal),padding:"5px 12px",fontSize:"11px",
+            fontWeight:700,color:C.textHi,pointerEvents:"none",letterSpacing:"0.06em",
+            fontFamily:"'Barlow Condensed',Arial,sans-serif",boxShadow:"0 4px 20px rgba(0,0,0,0.6)"}}>
+            {tip.label}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App(){
+  const [selAP,setSelAP]=useState("AUH");
+  const [search,setSearch]=useState("Abu Dhabi (AUH)");
+  const [ddItems,setDdItems]=useState([]);
+  const [showDD,setShowDD]=useState(false);
+  const [phase,setPhase]=useState("idle");
+  const [steps,setSteps]=useState([0,0,0]);
+  const [weather,setWeather]=useState(null);
+  const [flights,setFlights]=useState(null);
+  const [notams,setNotams]=useState(null);
+  const [notamLoading,setNotamLoading]=useState(false);
+  const [tab,setTab]=useState("dep");
+  const [clock,setClock]=useState("--:--:--");
+  const [localClock,setLocalClock]=useState("--:--:--");
+  const [rfTip,setRfTip]=useState(null);
+  const [selectedFlight,setSelectedFlight]=useState(null);
+
+  useEffect(()=>{
+    const tick=()=>{
+      const n=new Date();
+      setClock(`${String(n.getUTCHours()).padStart(2,"0")}:${String(n.getUTCMinutes()).padStart(2,"0")}:${String(n.getUTCSeconds()).padStart(2,"0")}`);
+      const tz=AIRPORTS[selAP]?.tz;
+      if(tz){
+        try{
+          setLocalClock(new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(n));
+        }catch{ setLocalClock("--:--:--"); }
+      }
+    };
+    tick(); const id=setInterval(tick,1000); return()=>clearInterval(id);
+  },[selAP]);
+
+  const setStep=(i,s)=>setSteps(p=>{const n=p.slice();n[i]=s;return n;});
+
+  const fetchNotams=useCallback((iata,icao)=>{
+    setNotamLoading(true);setNotams(null);
+    const ap=AIRPORTS[iata];
+    const prompt=`Generate 10-14 realistic NOTAMs for ${ap.name} (${iata}/${icao}), ${ap.city}, valid at current UTC ${new Date().toUTCString()}.
+Return JSON array of objects with: id, category(RWY/ILS/NAV/OBST/COM/AD/AIRSPACE), severity(low/medium/high), subject, description(2-3 sentences), valid_from(HH:MM UTC), valid_to(HH:MM UTC or PERM), raw_notam(ICAO format short string).
+Mix categories realistically. Be specific to ${ap.city}.`;
+    callClaude({model:"claude-sonnet-4-20250514",max_tokens:3000,system:"You are an aviation NOTAM system. Return ONLY valid JSON array, no markdown, no fences.",messages:[{role:"user",content:prompt}]})
+      .then(r=>r.ok?r.json():null)
+      .then(d=>{const txt=(d&&d.content&&d.content[0])?d.content[0].text:"[]";setNotams(JSON.parse(txt.replace(/```json/g,"").replace(/```/g,"").trim()));setNotamLoading(false);})
+      .catch(()=>setNotamLoading(false));
+  },[]);
+
+  const run=useCallback((iata)=>{
+    const ap=AIRPORTS[iata];if(!ap) return;
+    setPhase("running");setSteps([1,0,0]);setFlights(null);setWeather(null);setSelectedFlight(null);
+    fetchNotams(iata,ap.icao);
+    const now=Math.floor(Date.now()/1000),begin=now-7200;
+    const safeJson=res=>res.ok?res.json().catch(()=>[]):Promise.resolve([]);
+    Promise.allSettled([
+      fetch(`https://opensky-network.org/api/flights/departure?airport=${ap.icao}&begin=${begin}&end=${now}`),
+      fetch(`https://opensky-network.org/api/flights/arrival?airport=${ap.icao}&begin=${begin}&end=${now}`)
+    ]).then(r=>{
+      const pD=r[0].status==="fulfilled"?safeJson(r[0].value):Promise.resolve([]);
+      const pA=r[1].status==="fulfilled"?safeJson(r[1].value):Promise.resolve([]);
+      return Promise.all([pD,pA]);
+    }).catch(()=>[[],[]]).then(pair=>{
+      const adsb=(Array.isArray(pair[0])&&pair[0].length>0)?{deps:pair[0].slice(0,10),arrs:(Array.isArray(pair[1])?pair[1]:[]).slice(0,10)}:null;
+      setStep(0,2);setStep(1,1);
+      return fetch(`https://api.open-meteo.com/v1/forecast?latitude=${ap.lat}&longitude=${ap.lon}&current=temperature_2m,wind_speed_10m,weather_code,visibility`)
+        .then(wr=>wr.ok?wr.json():null).catch(()=>null)
+        .then(wj=>{
+          const wx=wj?wj.current:null;setWeather(wx);setStep(1,2);setStep(2,1);
+          const wxStr=wx?`${wx.temperature_2m}C wind ${wx.wind_speed_10m}kmh code ${wx.weather_code} vis ${wx.visibility}m`:"unavailable";
+          const adsbStr=adsb?JSON.stringify(adsb).slice(0,1500):"UNAVAILABLE - generate realistic flights";
+          const validICAOs=Object.values(AIRPORTS).map(a=>`${a.icao}(${a.city})`).join(",");
+          const prompt=`Airport: ${ap.name} (${iata}/${ap.icao}), ${ap.city}\nUTC: ${new Date().toUTCString()}\nWeather: ${wxStr}\nADS-B: ${adsbStr}
+\nReturn JSON with keys deps and arrs, each 8-12 objects.
+\nIMPORTANT: dest_icao and orig_icao MUST be chosen ONLY from this list: ${validICAOs}
+\nDep fields: callsign(ICAO), dest_icao(from list above), destination_name, delay_probability(0-100), risk_level(low/medium/high), risk_factors(array from: CTOT REGULATION,WEATHER,LATE INBOUND,CREW REST,SLOT CONSTRAINT,WIND SHEAR,LOW VISIBILITY,HIGH LOAD,ATC RESTRICTION,GATE CONFLICT), eobt_offset(-60 to 180), tobt_delta(-5 to 30), ctot_regulated(bool), ctot_delta(int), taxi_minutes(int), estimated_delay_minutes(int).
+\nArr fields: callsign, orig_icao(from list above), origin_name, delay_probability, risk_level, risk_factors, sta_offset(-60 to 180), eta_delta(-10 to 45), taxi_in_minutes, estimated_delay_minutes.
+\nAirlines for ${ap.city}: ETD=EY Etihad, UAE=EK Emirates, QTR=QR Qatar, BAW=BA British, DLH=LH Lufthansa, THY=TK Turkish, GFA=GF Gulf Air. 50pct low, 35pct medium, 15pct high risk.`;
+          return callClaude({model:"claude-sonnet-4-20250514",max_tokens:4000,system:"You are a flight delay prediction expert. Return ONLY valid JSON, no markdown.",messages:[{role:"user",content:prompt}]});
+        });
+    }).then(res=>{if(!res||!res.ok)throw new Error("err");return res.json();})
+    .then(rd=>{const txt=(rd.content&&rd.content[0])?rd.content[0].text:"";setFlights(JSON.parse(txt.replace(/```json/g,"").replace(/```/g,"").trim()));setStep(2,2);setPhase("done");})
+    .catch(()=>{setStep(2,3);setPhase("error");});
+  },[fetchNotams]);
+
+  useEffect(()=>{run("AUH");},[]);
+
+  const onSearch=v=>{
+    setSearch(v);if(!v.trim()){setDdItems([]);setShowDD(false);return;}
+    const q=v.toUpperCase();
+    setDdItems(Object.entries(AIRPORTS).filter(([k,a])=>k.includes(q)||a.city.toUpperCase().includes(q)||a.name.toUpperCase().includes(q)).slice(0,8).map(([k,a])=>({iata:k,...a})));
+    setShowDD(true);
+  };
+  const pick=iata=>{const ap=AIRPORTS[iata];setSelAP(iata);setSearch(ap?`${ap.city} (${iata})`:iata);setShowDD(false);run(iata);};
+  const onRun=()=>{if(ddItems[0])pick(ddItems[0].iata);else if(AIRPORTS[search.toUpperCase()])pick(search.toUpperCase());};
+
+  const ap=AIRPORTS[selAP];
+  const apTz=ap?.tz;
+  const deps=(flights&&flights.deps?flights.deps:[]).map(f=>({...f,times:depTimes(f,apTz)}));
+  const arrs=(flights&&flights.arrs?flights.arrs:[]).map(f=>({...f,times:arrTimes(f,apTz)}));
+  const avgD=deps.length?Math.round(deps.reduce((s,f)=>s+(f.delay_probability||0),0)/deps.length):0;
+  const avgA=arrs.length?Math.round(arrs.reduce((s,f)=>s+(f.delay_probability||0),0)/arrs.length):0;
+  const wxDesc=(weather&&weather.weather_code!=null)?(WX[weather.weather_code]||"CODE "+weather.weather_code):"N/A";
+  const apIcao=ap?ap.icao:"----",apName=ap?ap.name.toUpperCase():"---",apCity=ap?ap.city.toUpperCase():"";
+
+  const stepCols=steps.map(s=>s===2?C.green:s===3?C.red:s===1?C.teal:"rgba(255,255,255,0.18)");
+  const stepLbls=steps.map(s=>s===2?"DONE":s===3?"ERR":s===1?"LIVE":"WAIT");
+  const stepDef=[{l:"ADS-B / OPENSKY",s:"DEP + ARR DATA"},{l:"METEO / OPEN-METEO",s:"SURFACE WEATHER"},{l:"AI ANALYSIS / CLAUDE",s:"DELAY PREDICTION"}];
+
+  const metrics=[["AIRPORT",selAP],["ICAO",apIcao],["CITY",apCity],["DEPARTURES",String(deps.length)],["ARRIVALS",String(arrs.length)],["AVG DEP DELAY",deps.length?avgD+"%":"--"],["AVG ARR DELAY",arrs.length?avgA+"%":"--"],["CONDITIONS",wxDesc],["TEMP",weather&&weather.temperature_2m!=null?`${weather.temperature_2m}°C`:"--"],["WIND",weather&&weather.wind_speed_10m!=null?Math.round(weather.wind_speed_10m)+" KMH":"--"],["VISIBILITY",weather&&weather.visibility!=null?Math.round(weather.visibility/1000)+" KM":"--"]];
+
+  // Fuzzy airport lookup: exact ICAO first, then city name, then partial name
+  function findAP(icao, name){
+    const all=Object.values(AIRPORTS);
+    if(icao){ const exact=all.find(a=>a.icao===icao); if(exact) return exact; }
+    if(name){
+      const n=name.toLowerCase();
+      const byCity=all.find(a=>a.city.toLowerCase()===n||n.includes(a.city.toLowerCase())||a.city.toLowerCase().includes(n));
+      if(byCity) return byCity;
+      const byName=all.find(a=>a.name.toLowerCase().includes(n.split(" ")[0])||n.includes(a.name.toLowerCase().split(" ")[0]));
+      if(byName) return byName;
+    }
+    return null;
+  }
+  const depList=[],arrList=[];
+  deps.forEach(f=>{const d=findAP(f.dest_icao,f.destination_name);if(d)depList.push({ap:d,f});});
+  arrs.forEach(f=>{const o=findAP(f.orig_icao,f.origin_name);if(o)arrList.push({ap:o,f});});
+
+  const notamHighCount=(notams||[]).filter(n=>n.severity==="high").length;
+
+  const TH=({c})=><th style={{color:C.textLo,padding:"8px 10px",textAlign:"left",borderBottom:"1px solid "+C.border,fontWeight:700,letterSpacing:"0.1em",whiteSpace:"nowrap",fontSize:"10px",background:C.surface,position:"sticky",top:0,zIndex:2}}>{c}</th>;
+  const TD=({c,children,style:s})=>{const b={padding:"8px 10px",borderBottom:"1px solid "+C.borderS,whiteSpace:"nowrap",verticalAlign:"middle",background:"inherit"};return <td style={s?{...b,...s}:b}>{children!==undefined?children:c}</td>;};
+  const RiskTag=({level="low"})=>{const col=rc(level);return <span style={{display:"inline-block",padding:"2px 8px",fontSize:"9px",fontWeight:700,letterSpacing:"0.08em",color:col,background:"rgba(0,0,0,0.3)",border:"1px solid "+col}}>{level.toUpperCase()}</span>;};
+  const Bar=({pct,level})=>(
+    <div style={{display:"flex",alignItems:"center",gap:7}}>
+      <div style={{width:56,height:5,background:"rgba(255,255,255,0.08)",borderRadius:3}}>
+        <div style={{width:(pct||0)+"%",height:"100%",background:rc(level),borderRadius:3}}/>
+      </div>
+      <span style={{color:rc(level),fontSize:"11px",fontWeight:700,minWidth:30}}>{pct||0}%</span>
+    </div>
+  );
+  const Tags=({items})=>(
+    <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+      {(items||[]).map((t,i)=>{
+        const known=!!RF[t];
+        return <span key={i}
+          onMouseEnter={e=>{if(!selectedFlight)setRfTip({factor:t,x:e.clientX+12,y:e.clientY-8});}}
+          onMouseLeave={()=>setRfTip(null)}
+          style={{fontSize:"9px",padding:"2px 7px",background:known?C.tealDim:"rgba(255,255,255,0.05)",border:"1px solid "+(known?C.teal:C.border),color:known?C.teal:C.textMid,cursor:"help"}}>
+          {t}
+        </span>;
+      })}
+    </div>
+  );
+
+  const depH=["#","FLIGHT","AIRLINE","DESTINATION","RISK","EOBT (LT)","TOBT (LT)","TSAT (LT)","CTOT (LT)","TTOT (LT)","TAXI","DELAY %","RISK FACTORS"];
+  const arrH=["#","FLIGHT","AIRLINE","ORIGIN","RISK","STA (LT)","ETA (LT)","ELDT (LT)","EGTT (LT)","VAR","DELAY %","RISK FACTORS"];
+
+  const CSS=`
+    @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@700&display=swap');
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+    @keyframes loadbar{0%{width:0%}60%{width:78%}100%{width:96%}}
+    @keyframes ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+    @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+    .frow{cursor:pointer;transition:background 0.1s}
+    .frow:hover td{background:${C.hover}!important}
+    .frow-sel td{background:${C.raised}!important}
+    .detail-panel{animation:slideIn 0.22s cubic-bezier(0.22,1,0.36,1)}
+    ::-webkit-scrollbar{width:4px;height:4px}
+    ::-webkit-scrollbar-track{background:${C.bg}}
+    ::-webkit-scrollbar-thumb{background:${C.teal};border-radius:2px}
+  `;
+
+  return(
+    <div style={{background:C.bg,color:C.textHi,fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"13px",letterSpacing:"0.04em",minHeight:"100vh"}}
+      onClick={e=>{if(selectedFlight&&!e.target.closest(".detail-panel"))setSelectedFlight(null);}}>
+      <style>{CSS}</style>
+      {rfTip&&<RFTooltip factor={rfTip.factor} x={rfTip.x} y={rfTip.y}/>}
+      {selectedFlight&&<DetailPanel flight={selectedFlight.flight} isDep={selectedFlight.isDep} selAP={selAP} onClose={()=>setSelectedFlight(null)}/>}
+
+      {/* HEADER */}
+      <div style={{background:`linear-gradient(135deg,${C.raised},${C.surface})`,borderBottom:"3px solid "+C.teal,padding:"0 24px",position:"relative",overflow:"hidden"}}>
+        <div style={{position:"absolute",right:80,top:-60,width:300,height:300,borderRadius:"50%",background:C.teal,opacity:0.03,filter:"blur(60px)",pointerEvents:"none"}}/>
+        <div style={{display:"flex",alignItems:"center",padding:"12px 0 8px",gap:20}}>
+          <div>
+            <div style={{color:C.textHi,fontSize:"19px",fontWeight:700,letterSpacing:"0.06em",lineHeight:1}}>FLIGHT DELAY PREDICTOR</div>
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:16}}>
+            {[["CDM ACTIVE",C.green,true],["ATFM NOMINAL",C.green,false]].map(([l,c,bl])=>(
+              <div key={l} style={{display:"flex",gap:5,alignItems:"center"}}>
+                <div style={{width:7,height:7,background:c,borderRadius:"50%",animation:bl?"blink 2s infinite":"none"}}/>
+                <span style={{fontSize:"9px",color:c,letterSpacing:"0.12em",fontWeight:700}}>{l}</span>
+              </div>
+            ))}
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:1}}>
+              <span style={{fontSize:"12px",color:C.textMid,fontFamily:"monospace",letterSpacing:"0.08em",padding:"3px 8px",background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border}}>{clock}</span>
+              <span style={{fontSize:"7px",color:C.textLo,letterSpacing:"0.12em",fontWeight:700,paddingRight:2}}>UTC / Z</span>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:1}}>
+              <span style={{fontSize:"12px",color:C.teal,fontFamily:"monospace",letterSpacing:"0.08em",padding:"3px 8px",background:"rgba(0,0,0,0.3)",border:"1px solid "+C.border,borderLeft:"2px solid "+C.teal}}>{localClock}</span>
+              <span style={{fontSize:"7px",color:C.textLo,letterSpacing:"0.12em",fontWeight:700,paddingRight:2}}>{selAP} LOCAL</span>
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0 10px",borderTop:"1px solid "+C.border,flexWrap:"wrap"}}>
+          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <span style={{color:C.teal,fontSize:"20px",fontWeight:700,letterSpacing:"0.1em"}}>{selAP}</span>
+            <span style={{color:C.border,fontSize:"18px"}}>/</span>
+            <span style={{color:C.textMid,fontSize:"14px",fontWeight:600}}>{apIcao}</span>
+            <div style={{width:1,height:16,background:C.border}}/>
+            <span style={{color:C.textMid,fontSize:"11px"}}>{apName}</span>
+            <div style={{width:1,height:16,background:C.border}}/>
+            <span style={{color:C.textLo,fontSize:"10px"}}>{apCity} TMA</span>
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",gap:8,alignItems:"center",position:"relative"}}>
+            <div style={{position:"relative"}}>
+              <input style={{background:"rgba(0,0,0,0.4)",border:"1px solid "+C.border,borderLeft:"3px solid "+C.teal,color:C.textHi,padding:"8px 14px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"12px",letterSpacing:"0.08em",textTransform:"uppercase",width:230,outline:"none"}}
+                placeholder="IATA CODE OR CITY" value={search}
+                onChange={e=>onSearch(e.target.value)}
+                onKeyDown={e=>{if(e.key==="Enter")onRun();}}
+                onFocus={()=>{if(search)onSearch(search);}}
+                onBlur={()=>setTimeout(()=>setShowDD(false),150)}/>
+              {showDD&&ddItems.length>0&&(
+                <div style={{position:"absolute",top:"100%",left:0,zIndex:200,background:C.surface,border:"1px solid "+C.teal,width:300,maxHeight:220,overflowY:"auto",boxShadow:"0 16px 40px rgba(0,0,0,0.7)"}}>
+                  {ddItems.map(it=>(
+                    <div key={it.iata} onMouseDown={()=>pick(it.iata)}
+                      style={{padding:"9px 14px",borderBottom:"1px solid "+C.borderS,cursor:"pointer",display:"flex",alignItems:"center",gap:10}}
+                      onMouseEnter={e=>{e.currentTarget.style.background=C.hover;}}
+                      onMouseLeave={e=>{e.currentTarget.style.background="";}}>
+                      <span style={{color:C.teal,fontWeight:700,minWidth:34,fontSize:"13px"}}>{it.iata}</span>
+                      <span style={{color:C.textHi,fontSize:"12px"}}>{it.city}</span>
+                      <span style={{color:C.textLo,fontSize:"10px",marginLeft:"auto"}}>{it.icao}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button onClick={onRun} style={{background:C.teal,border:"none",color:C.bg,padding:"9px 26px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"12px",fontWeight:700,letterSpacing:"0.14em",textTransform:"uppercase",cursor:"pointer"}}
+              onMouseEnter={e=>{e.currentTarget.style.background="#00EEEE";}}
+              onMouseLeave={e=>{e.currentTarget.style.background=C.teal;}}>RUN</button>
+          </div>
+        </div>
+      </div>
+
+      {/* PIPELINE */}
+      <div style={{display:"flex",alignItems:"center",padding:"7px 24px",background:C.surface,borderBottom:"1px solid "+C.border,flexWrap:"wrap",rowGap:4}}>
+        {stepDef.map((sc,i)=>(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"3px 16px",borderLeft:"2px solid "+stepCols[i],opacity:steps[i]===0?0.25:1,marginRight:8}}>
+            <div style={{width:7,height:7,background:stepCols[i],borderRadius:"50%",animation:steps[i]===1?"blink 1s infinite":"none"}}/>
+            <div>
+              <div style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.1em",color:stepCols[i]}}>{sc.l}</div>
+              <div style={{fontSize:"9px",color:C.textLo}}>{sc.s}</div>
+            </div>
+            <span style={{marginLeft:4,fontSize:"9px",color:stepCols[i],fontWeight:700}}>{stepLbls[i]}</span>
+            {i<2&&<div style={{width:20,height:1,background:C.border,marginLeft:6}}/>}
+          </div>
+        ))}
+        <div style={{marginLeft:"auto",fontSize:"10px",letterSpacing:"0.1em",fontWeight:700,animation:phase==="running"?"blink 1s infinite":"none",color:phase==="done"?C.teal:phase==="error"?C.red:C.textMid}}>
+          {phase==="running"&&"COMPUTING DELAY PREDICTIONS..."}
+          {phase==="done"&&`${deps.length} DEP  ${arrs.length} ARR  PREDICTIONS READY`}
+          {phase==="error"&&"PIPELINE FAULT — RETRY"}
+        </div>
+      </div>
+
+      {/* Loading bar */}
+      <div style={{height:3,background:C.border,position:"relative",overflow:"hidden"}}>
+        {phase==="running"&&<div style={{position:"absolute",left:0,top:0,height:"100%",width:"0%",background:C.teal,animation:"loadbar 8s ease-out forwards"}}/>}
+        {phase==="done"&&<div style={{position:"absolute",left:0,top:0,height:"100%",width:"100%",background:C.teal}}/>}
+        {phase==="error"&&<div style={{position:"absolute",left:0,top:0,height:"100%",width:"100%",background:C.red}}/>}
+      </div>
+
+      {/* METRICS BAR */}
+      <div style={{display:"flex",background:C.bgDeep,borderBottom:"1px solid "+C.border,overflowX:"auto"}}>
+        {metrics.map((item,i)=>(
+          <div key={i} style={{padding:"10px 20px",borderRight:"1px solid "+C.border,minWidth:90,flexShrink:0}}>
+            <div style={{color:C.textLo,fontSize:"8px",letterSpacing:"0.16em",textTransform:"uppercase",marginBottom:4,fontWeight:700}}>{item[0]}</div>
+            <div style={{color:C.textHi,fontSize:item[1].length>6?"13px":"18px",fontWeight:700}}>{item[1]}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ALERT TICKER */}
+      {phase==="done"&&<AlertTicker flights={tab==="dep"?deps:arrs}/>}
+
+      {/* TABS */}
+      <div style={{display:"flex",alignItems:"center",padding:"0 24px",borderBottom:"1px solid "+C.border,background:C.surface,flexWrap:"wrap",position:"sticky",top:0,zIndex:10}}>
+        {[
+          {key:"dep",label:`DEPARTURES (${deps.length})`,col:C.teal},
+          {key:"arr",label:`ARRIVALS (${arrs.length})`,col:"#6699FF"},
+          {key:"metrics",label:"METRICS",col:"#A060FF"},
+          {key:"notam",label:`NOTAM${notamHighCount>0?" ⚠"+notamHighCount:""}`,col:C.amber},
+        ].map(({key,label,col})=>(
+          <button key={key} onClick={()=>{setTab(key);setSelectedFlight(null);}}
+            style={{background:"none",border:"none",borderBottom:tab===key?`3px solid ${col}`:"3px solid transparent",color:tab===key?C.textHi:C.textLo,padding:"11px 22px",fontFamily:"'Barlow Condensed',Arial,sans-serif",fontSize:"12px",fontWeight:700,letterSpacing:"0.12em",textTransform:"uppercase",cursor:"pointer"}}>
+            {label}
+          </button>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:4}}>
+          <span style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.12em",marginRight:6,fontWeight:700}}>DELAY RISK</span>
+          {[["LOW","< 30%","low"],["MEDIUM","30–60%","medium"],["HIGH","> 60%","high"]].map(([l,s,r])=>(
+            <div key={r} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderLeft:"2px solid "+rc(r)}}>
+              <span style={{color:rc(r),fontSize:"9px",fontWeight:700}}>{l}</span>
+              <span style={{color:C.textLo,fontSize:"9px"}}>{s}</span>
+            </div>
+          ))}
+          {phase==="done"&&(tab==="dep"||tab==="arr")&&<span style={{color:C.textLo,fontSize:"9px",marginLeft:10}}>CLICK ROW FOR DETAILS</span>}
+        </div>
+      </div>
+
+      {/* STATS STRIP */}
+      {phase==="done"&&(tab==="dep"||tab==="arr")&&<StatsStrip deps={deps} arrs={arrs}/>}
+
+      {/* MAP */}
+      {(tab==="dep"||tab==="arr")&&<MapPanel ap={ap} selAP={selAP} routes={tab==="dep"?depList:arrList} isDep={tab==="dep"}/>}
+
+      {/* TABLE */}
+      {(tab==="dep"||tab==="arr")&&(
+        <div style={{overflowX:"auto",maxHeight:500,overflowY:"auto"}}>
+          {phase==="running"&&<div style={{padding:"48px",textAlign:"center",color:C.teal,letterSpacing:"0.12em",animation:"blink 1s infinite",fontSize:"13px",fontWeight:700}}>COMPUTING DELAY PREDICTIONS...</div>}
+          {phase==="error"&&<div style={{padding:"48px",textAlign:"center",color:C.red,letterSpacing:"0.12em",fontSize:"13px",fontWeight:700}}>PIPELINE FAULT — RETRY</div>}
+
+          {phase==="done"&&tab==="dep"&&(
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:"12px"}}>
+              <thead><tr>{depH.map(h=><TH key={h} c={h}/>)}</tr></thead>
+              <tbody>{deps.map((f,i)=>{
+                const cs=parseCS(f.callsign),t=f.times;
+                const isSel=selectedFlight&&selectedFlight.flight===f&&selectedFlight.isDep;
+                return(
+                  <tr key={i} className={"frow"+(isSel?" frow-sel":"")} style={{background:isSel?C.raised:C.bg}}
+                    onClick={()=>setSelectedFlight({flight:f,isDep:true})}>
+                    <TD style={{color:C.textLo,fontSize:"11px"}} c={String(i+1).padStart(2,"0")}/>
+                    <TD style={{color:C.teal,fontWeight:700,letterSpacing:"0.08em",fontSize:"13px"}}>{cs.flight}{isSel&&<span style={{marginLeft:6,fontSize:"10px"}}>▶</span>}</TD>
+                    <TD style={{color:C.textMid}} c={cs.airline}/>
+                    <TD style={{color:C.textHi}} c={f.destination_name||"---"}/>
+                    <TD><RiskTag level={f.risk_level}/></TD>
+                    <TD style={{fontFamily:"monospace",color:C.textMid,fontSize:"12px"}} c={t.EOBT}/>
+                    <TD style={{fontFamily:"monospace",color:C.textHi,fontSize:"12px",fontWeight:600}} c={t.TOBT}/>
+                    <TD style={{fontFamily:"monospace",color:C.teal,fontSize:"12px",fontWeight:600}} c={t.TSAT}/>
+                    <TD style={{fontFamily:"monospace",color:f.ctot_regulated?C.amber:C.textLo,fontSize:"12px"}} c={t.CTOT}/>
+                    <TD style={{fontFamily:"monospace",color:C.green,fontSize:"12px",fontWeight:600}} c={t.TTOT}/>
+                    <TD style={{color:C.textLo}} c={(f.taxi_minutes||18)+"M"}/>
+                    <TD><Bar pct={f.delay_probability||0} level={f.risk_level||"low"}/></TD>
+                    <TD><Tags items={f.risk_factors}/></TD>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          )}
+
+          {phase==="done"&&tab==="arr"&&(
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:"12px"}}>
+              <thead><tr>{arrH.map(h=><TH key={h} c={h}/>)}</tr></thead>
+              <tbody>{arrs.map((f,i)=>{
+                const cs=parseCS(f.callsign),t=f.times,v=f.eta_delta||0;
+                const isSel=selectedFlight&&selectedFlight.flight===f&&!selectedFlight.isDep;
+                return(
+                  <tr key={i} className={"frow"+(isSel?" frow-sel":"")} style={{background:isSel?C.raised:C.bg}}
+                    onClick={()=>setSelectedFlight({flight:f,isDep:false})}>
+                    <TD style={{color:C.textLo,fontSize:"11px"}} c={String(i+1).padStart(2,"0")}/>
+                    <TD style={{color:C.teal,fontWeight:700,letterSpacing:"0.08em",fontSize:"13px"}}>{cs.flight}{isSel&&<span style={{marginLeft:6,fontSize:"10px"}}>▶</span>}</TD>
+                    <TD style={{color:C.textMid}} c={cs.airline}/>
+                    <TD style={{color:C.textHi}} c={f.origin_name||"---"}/>
+                    <TD><RiskTag level={f.risk_level}/></TD>
+                    <TD style={{fontFamily:"monospace",color:C.textMid,fontSize:"12px"}} c={t.STA}/>
+                    <TD style={{fontFamily:"monospace",color:C.textHi,fontSize:"12px",fontWeight:600}} c={t.ETA}/>
+                    <TD style={{fontFamily:"monospace",color:C.teal,fontSize:"12px",fontWeight:600}} c={t.ELDT}/>
+                    <TD style={{fontFamily:"monospace",color:C.green,fontSize:"12px",fontWeight:600}} c={t.EGTT}/>
+                    <TD style={{color:v>10?C.red:v>0?C.amber:C.green,fontWeight:700,fontSize:"12px"}} c={(v>=0?"+":"")+v+"M"}/>
+                    <TD><Bar pct={f.delay_probability||0} level={f.risk_level||"low"}/></TD>
+                    <TD><Tags items={f.risk_factors}/></TD>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab==="metrics"&&<MetricsDashboard deps={deps} arrs={arrs} selAP={selAP}/>}
+      {tab==="notam"&&<NOTAMFeed notams={notams} loading={notamLoading} selAP={selAP} apName={ap?ap.name:selAP}/>}
+
+      {/* FOOTER */}
+      <div style={{borderTop:"1px solid "+C.border,padding:"10px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:C.bgDeep}}>
+        <span style={{color:C.textLo,fontSize:"9px",letterSpacing:"0.14em"}}>FLIGHT DELAY PREDICTOR  ·  OPENSKY / OPEN-METEO / ANTHROPIC</span>
+        <span style={{color:C.border,fontSize:"9px"}}>v4.0</span>
+      </div>
+    </div>
+  );
+}
+
+
+// ── MOUNT APP ─────────────────────────────────────────────────────────────────
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
